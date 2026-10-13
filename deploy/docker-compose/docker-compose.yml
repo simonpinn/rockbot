@@ -104,6 +104,9 @@ services:
       LLM__Provider: ${LLM_PROVIDER:-}
       # Copilot path — GITHUB_TOKEN is read by the Copilot CLI subprocess
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # GitHub MCP server — mcp.json's github entry sends this as its bearer header.
+      # Set up with deploy/github/setup.sh (a fine-grained, read-only PAT; separate from GITHUB_TOKEN).
+      GITHUB_MCP_TOKEN: ${GITHUB_MCP_TOKEN:-}
       # Per-tier model IDs (LLM_MODEL_ID sets Balanced; Low/High fall back to Balanced)
       LLM__Balanced__ModelId: ${LLM_MODEL_ID:-anthropic/claude-haiku-4.5}
       LLM__Low__ModelId: ${LLM_LOW_MODEL_ID:-}
@@ -198,6 +201,21 @@ services:
       Graph__ClientId: ${GRAPH_CLIENT_ID:-}
       Graph__ClientSecret: ${GRAPH_CLIENT_SECRET:-}
       Graph__Mailbox: ${GRAPH_MAILBOX:-}
+
+  # Trello boards, lists and cards: read, create, update, move and comment; no archive or delete
+  # (opt-in: COMPOSE_PROFILES=trello). Set up with deploy/trello/setup.sh. Only this container
+  # holds the Trello key and token.
+  trello-mcp:
+    profiles: ["trello"]
+    build:
+      context: ../..
+      dockerfile: src/McpServer.Trello/Dockerfile
+    image: rockylhotka/rockbot-trello-mcp:latest
+    restart: unless-stopped
+    environment:
+      Trello__ApiKey: ${TRELLO_API_KEY:-}
+      Trello__Token: ${TRELLO_TOKEN:-}
+      Trello__AllowedBoardIds: ${TRELLO_ALLOWED_BOARD_IDS:-}
 
   blazor-init:
     image: busybox:latest

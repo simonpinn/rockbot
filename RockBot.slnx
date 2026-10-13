@@ -11,6 +11,7 @@
     <Project Path="src/McpServer.Introspection/McpServer.Introspection.csproj" />
     <Project Path="src/McpServer.OpenRouter/McpServer.OpenRouter.csproj" />
 <Project Path="src/McpServer.TodoApp/McpServer.TodoApp.csproj" />
+    <Project Path="src/McpServer.Trello/McpServer.Trello.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/RockBot.Host.Abstractions/RockBot.Host.Abstractions.csproj" />
@@ -61,6 +62,7 @@
     <Project Path="tests/RockBot.Tools.Tests/RockBot.Tools.Tests.csproj" />
     <Project Path="tests/McpServer.TodoApp.Tests/McpServer.TodoApp.Tests.csproj" />
     <Project Path="tests/McpServer.Graph.Tests/McpServer.Graph.Tests.csproj" />
+    <Project Path="tests/McpServer.Trello.Tests/McpServer.Trello.Tests.csproj" />
     <Project Path="tests/RockBot.Scripts.Tests/RockBot.Scripts.Tests.csproj" />
     <Project Path="tests/RockBot.A2A.Tests/RockBot.A2A.Tests.csproj" />
     <Project Path="tests/RockBot.Telemetry.Tests/RockBot.Telemetry.Tests.csproj" />

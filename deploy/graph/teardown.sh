@@ -26,14 +26,8 @@ if ! $assume_yes; then
   [[ "$answer" == [yY]* ]] || die "aborted"
 fi
 
-compose=(docker compose --project-directory "$COMPOSE_DIR" -f "$COMPOSE_DIR/docker-compose.yml")
-if [[ -n "$("${compose[@]}" ps -q --status running agent 2>/dev/null)" ]]; then
-  "${compose[@]}" exec -T agent sh -c 'cat /data/agent/mcp.json 2>/dev/null || echo "{}"' \
-    | jq 'del(.mcpServers["graph-mail"])' \
-    | "${compose[@]}" exec -T agent sh -c 'cat > /data/agent/mcp.json.tmp && mv /data/agent/mcp.json.tmp /data/agent/mcp.json'
-  log "Unregistered graph-mail from the agent"
-fi
-"${compose[@]}" --profile graph rm -sf graph-mcp >/dev/null 2>&1 || true
+unregister_mcp_server graph-mail
+"${COMPOSE[@]}" --profile graph rm -sf graph-mcp >/dev/null 2>&1 || true
 
 if [[ -n "$app_id" ]]; then
   tty_flags=(-i)
@@ -59,9 +53,5 @@ fi
 for key in GRAPH_TENANT_ID GRAPH_CLIENT_ID GRAPH_CLIENT_SECRET GRAPH_SP_OBJECT_ID GRAPH_MAILBOX GRAPH_APP_NAME; do
   remove_env "$key"
 done
-profiles="$(env_get COMPOSE_PROFILES)"
-if [[ -n "$profiles" ]]; then
-  remaining="$(tr ',' '\n' <<<"$profiles" | grep -vx graph | paste -sd, - || true)"
-  if [[ -n "$remaining" ]]; then upsert_env COMPOSE_PROFILES "$remaining"; else remove_env COMPOSE_PROFILES; fi
-fi
+disable_profile graph
 log "Removed GRAPH_* settings from $ENV_FILE"

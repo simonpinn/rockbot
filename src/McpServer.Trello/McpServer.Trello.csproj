@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>McpServer.Trello</RootNamespace>
+    <UserSecretsId>mcpserver-trello-8e4d2b1c-5a6f-4e3d-9c8b-7a6f5e4d3c2b</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\McpServer.TodoApp\StrictArguments.cs" Link="StrictArguments.cs" />
+  </ItemGroup>
+
+</Project>
