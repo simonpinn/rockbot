@@ -43,7 +43,7 @@ if [[ -n "$app_id" ]]; then
     -e APP_ID="$app_id" \
     -v rockbot-pwsh-modules:/root/.local/share/powershell/Modules \
     -v "$GRAPH_DIR/scope-mailbox.ps1:/work/scope-mailbox.ps1:ro" \
-    "${PWSH_IMAGE:-mcr.microsoft.com/powershell:lts}" \
+    "${PWSH_IMAGE:-mcr.microsoft.com/powershell:7.5-ubuntu-24.04}" \
     pwsh -NoProfile -File /work/scope-mailbox.ps1
 fi
 

@@ -71,7 +71,7 @@ try {
     }
 
     Write-Host "==> Effective permissions for $smtp (InScope should be True for $role):"
-    Test-ServicePrincipalAuthorization -Identity $sp.Identity -Resource $smtp | Format-Table RoleName, GrantedPermissions, AllowedResourceScope, InScope -AutoSize
+    Test-ServicePrincipalAuthorization -Identity $sp.Identity -Resource $smtp | Format-List RoleName, GrantedPermissions, AllowedResourceScope, InScope
 }
 finally {
     Disconnect-ExchangeOnline -Confirm:$false | Out-Null
