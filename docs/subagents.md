@@ -116,12 +116,24 @@ Spawns a background subagent. Returns immediately with a `task_id`.
 spawn_subagent(
     description,      // Detailed instructions for the subagent (required)
     context?,         // Additional data or context to pass in
-    timeout_minutes?  // Max runtime — default 10 minutes
+    timeout_minutes?, // Max runtime — default 10 minutes
+    max_iterations?,  // Tool-loop cap; research/synthesis tasks get at least 20
+    consolidate?,     // Batch with sibling results (default true)
+    inputs?           // Exact working-memory keys / shared-volume paths to build on
 )
 → "Subagent spawned with task_id: abc123def456"
 ```
 
 If the concurrency limit is reached, returns an error string starting with `"Error:"`.
+
+`inputs` are checked at spawn. A key or path that does not exist fails the spawn with the
+close matches that do (keys in the same namespace, the same key name under another task,
+files with the same name), so a mistyped or copied key fails fast. Valid inputs are inlined
+into the subagent's starting context ahead of other prior work.
+
+A description that asks the subagent to research, investigate, verify, ground, synthesize,
+outline or draft — or to write a deck or document — raises a `max_iterations` below
+`SubagentOptions.ResearchIterationFloor` (20) to the floor, and logs it.
 
 ### `cancel_subagent`
 
@@ -213,6 +225,48 @@ Primary agent (on result, via SubagentResultHandler):
 - No explicit cleanup required in `SubagentResultHandler` — entries expire naturally
 - Cross-namespace reads are first-class in the working memory API, no workarounds needed
 
+A `get_from_working_memory` miss under `subagent/<id>/` lists the keys that do exist under
+that task — or, when the task has none, the same key name under another task and the recent
+subagent namespaces.
+
+### Prior work and the session work registry
+
+Later subagents see what earlier ones produced without the primary passing it along. The
+singleton `ISessionWorkRegistry` (RockBot.Host) keeps, per conversation (primary session):
+
+- **Subagent results** — task id, description, a summary (the first ~600 characters of the
+  output), the full output (capped), and the working-memory keys the subagent stored. Bulk
+  web/tool chunk keys (`…-chunkN`, `…-index`) are counted, not listed. Recorded by
+  `SubagentResultHandler` when the result arrives.
+- **Artifacts** — shared-volume files written, edited, moved or deleted (`file_*` tools) and
+  remote upload targets (any tool whose name contains `upload`, unwrapped from
+  `mcp_invoke_tool` or `{server}__{tool}`), with the last writer. Recorded from the loop's
+  tool-call ledger, so every tool call of every run passes the same hook. Subagent, worker and
+  wisp sessions are linked to their primary at spawn, so their writes count toward it; wisp
+  direct steps, which run outside any loop, record themselves.
+
+The registry is in memory, bounded (20 results, 50 artifacts per conversation, 24-hour
+expiry; `SessionWorkRegistryOptions`) and lost on restart — the keys and files it points at
+outlive it.
+
+`SubagentRunner` injects a **"Prior work in this conversation"** block into each new
+subagent's context: the user request that led to the spawn, the inputs, every earlier
+result (summary and keys) and every artifact. Under **"Read these first"** it names the two
+earlier results most relevant to the new task, with the exact `get_from_working_memory` calls
+that fetch them — ranked by keyword overlap between the new task and each result's description
+and summary, most recent first on a tie (with no overlap, only the most recent result). The
+block tells the subagent to ground its work in these results and that research wins over an
+older draft.
+
+The block is re-sent on every iteration of the subagent's loop, so it carries pointers rather
+than bodies (#695). Full text is inlined, up to `SubagentOptions.LineageInlineBudgetChars`
+(8,000), only for the spawn's `inputs` — what the primary passed on purpose — and for a
+relevant result that saved no keys, whose text could not be fetched any other way.
+
+For user turns, `AgentContextBuilder` adds a short **"Work products in this conversation"**
+section (≤1,500 characters) listing the files, uploads and result keys, so "the deck" resolves
+to a concrete path.
+
 ---
 
 ## Message types
@@ -248,8 +302,40 @@ public sealed record SubagentResultMessage
     public required bool IsSuccess { get; init; }
     public string? Error { get; init; }
     public required DateTimeOffset Timestamp { get; init; }
+    public string? BatchId { get; init; }
+    public bool Consolidate { get; init; } = true;
+    public string? OriginatingUserRequest { get; init; } // #666
+    public string? Description { get; init; }            // #665
+    public IReadOnlyList<SubagentToolCallSummary>? ToolCalls { get; init; } // #683
+    public int? ToolCallCount { get; init; }             // #683
+    public string? RunOrigin { get; init; }              // #685
+    public string? UserAskedFor { get; init; }           // #685
 }
 ```
+
+`RunOrigin` and `UserAskedFor` are the consequential-action scope the subagent ran under (#685):
+`SubagentManager` captures the spawning run's scope at spawn (`SubagentEntry.ActionGate`, origin
+`subagent-of-user-turn` for a user turn) and `SubagentRunner` runs under it, so a subagent spawned
+from an information-only user message cannot create events, send mail or upload files — the call
+comes back "Not run: …" and the subagent reports the change as a proposal instead. Wisps and
+workers it starts inherit the same scope. The synthesis turn relaying the result runs under it
+too. See [Consequential-action gate](agent-host.md#consequential-action-gate).
+
+`ToolCalls` is a compact copy of the subagent run's tool-call ledger: up to 40 calls, each with
+its name, ok/failed, whether it changed state, and a short argument summary. `ToolCallCount` is
+the total number of calls. The primary's synthesis turn passes both to the completion evaluator,
+with the session-work-registry artifacts written by the subagent and its wisps. The evaluator
+checks the relayed report's claims against what the subagent actually did, not against the
+synthesis turn's own read-only calls. See
+[When the completion evaluator runs](agent-host.md#when-the-completion-evaluator-runs).
+Both properties are null on results from an older build.
+
+A batch call such as `spawn_wisps` carries a `Detail` (`6 of 7 wisps failed`) and up to 15
+`Nested` calls, which are the calls its wisps made, each with its own outcome (#686). Before this,
+a batch whose wisps all aborted was relayed as one successful `spawn_wisps`. A subagent also runs
+the evaluator on its own reply before the result is published. It runs only for the
+`side-effect`, `bare-claim` and `claimed-change` triggers, so a claim like "seven events created
+and verified" or "I updated the checklist" must be backed by the subagent's own calls.
 
 Topic: `subagent.result`
 
@@ -343,6 +429,9 @@ public sealed class SubagentOptions
 {
     public int MaxConcurrentSubagents { get; set; } = 3;
     public int DefaultTimeoutMinutes { get; set; } = 10;
+    public int LineageInlineBudgetChars { get; set; } = 8_000;  // inputs inlined per subagent (#695)
+    public int ResearchIterationFloor { get; set; } = 20;       // min max_iterations for research tasks
+    // (consolidation timeouts omitted)
 }
 ```
 

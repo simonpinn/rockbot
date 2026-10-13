@@ -6,9 +6,9 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton<TodoRepository>();
 builder.Services.AddHealthChecks();
-builder.Services.AddMcpServer()
+builder.Services.AddMcpServer(options => options.ServerInstructions = ServerInstructions.Text)
     .WithHttpTransport()
-    .WithTools<TodoTools>()
+    .WithTools<TodoTools>(ToolJson.Options)
     .WithStrictArguments();
 
 var app = builder.Build();

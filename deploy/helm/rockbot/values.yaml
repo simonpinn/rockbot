@@ -36,6 +36,14 @@ agent:
   # model families should set the highest factor among them — over-counting an
   # image by a few hundred tokens is cheap, and under-counting is the context
   # overflow the estimate exists to see coming.
+  #
+  # Context size (#670). Interactive turns hold rarely used tool families back
+  # until the conversation loads them, and replay older history shortened. To
+  # send every tool on every request, or replay history in full:
+  #
+  #   AgentHost__DeferRareToolFamilies: "false"
+  #   AgentHost__HistoryOlderTurnMaxChars: "0"
+  #   AgentHost__RelayedSubagentTurnMaxChars: "0"
   extraEnv: {}
   # HTTP endpoint the frontends upload attachments to. Bytes for a screenshot-sized file go
   # here rather than through RabbitMQ, which holds message bodies in memory until they are
@@ -44,6 +52,24 @@ agent:
   attachmentUpload:
     enabled: true
     port: 8082
+  # How downstream MCP tools are offered to the model. "Off": only the mcp_* management
+  # tools (every call goes through mcp_invoke_tool). "Eager": every downstream tool is also
+  # registered as a typed {server}__{tool} tool with its own parameter schema. See #420.
+  # "Lazy": the same typed tools, but a session only gets the ones it finds with
+  # mcp_find_tools, opens with mcp_get_service_details, or calls by name. See #612.
+  # "Pinned" (default): lazy, and once a session calls a server (either way) all of that
+  # server's typed tools stay in its list. #613 measured the modes on each tier
+  # (docs/measurements/2026-10-07-mcp-wrapper-modes.md): pinned matched or beat lazy
+  # everywhere, and eager puts every typed tool in every request, which the main agent's
+  # list can't hold under the providers' 128-tool cap once all servers are connected.
+  mcpWrapperMode: "Pinned"
+  # Per-tier overrides of mcpWrapperMode (#613): the run's model tier picks its mode, so a
+  # weak model can get eager typed tools while a strong one keeps a small baseline. Leave a
+  # tier empty to use mcpWrapperMode.
+  mcpWrapperModeByTier:
+    low: ""
+    balanced: ""
+    high: ""
   # Always Recreate — only one agent may run at a time (stateful)
   replicaCount: 1
   # IANA timezone ID injected into every LLM prompt as current date/time context.
@@ -115,6 +141,12 @@ blazor:
   # so raising this does not scale the UI — it deadlocks the rollout with the second
   # pod stuck Pending on a volume the first one already holds.
   replicaCount: 1
+  # How long the chat page waits for the agent's reply before showing "No reply received
+  # (timeout)", as a .NET TimeSpan ("00:10:00"). Empty keeps the built-in 3 minutes. Raise
+  # it for a slow self-hosted model: a turn with a tool round makes two full model calls.
+  # The agent finishes and saves the reply regardless; this only changes when the page
+  # stops waiting for it.
+  replyTimeout: ""
   resources:
     requests:
       cpu: 100m
@@ -282,16 +314,18 @@ rabbitmq:
   userName: ""      # REQUIRED
   virtualHost: /
   managementApiBaseUrl: ""  # optional — e.g. http://rabbitmq-mgmt.default.svc.cluster.local:15672
-                            # required for DLQ depth metrics (rockbot.messaging.dlq.depth)
-                            # required for dlqRetention policy application (below)
+                            # required for DLQ depth metrics (rockbot.messaging.dlq.depth),
+                            # the DLQ-growth alert built on them, and DLQ sampling by the dream cycle
 
-  # DLQ retention policy — applied via RabbitMQ Management API on every helm install/upgrade.
-  # Matches all *.dlq queues and enforces TTL + max-length so messages cannot accumulate forever.
-  # Only active when managementApiBaseUrl is also set.
+  # DLQ retention — applied by the agent itself as queue arguments when it declares each
+  # *.dlq queue (no Management API or policy needed). Queue arguments combine with broker
+  # policies and the stricter limit wins, so no policy can lift these caps.
+  # See design/messaging.md "Retention and expiry".
   dlqRetention:
     enabled: true
-    messageTtlMs: 259200000  # 72 hours — messages older than this are expired by the broker
-    maxLength: 10000          # drop oldest messages (drop-head) when queue exceeds this count
+    messageTtlMs: 259200000     # 72 hours — messages older than this are expired by the broker
+    maxLength: 10000            # drop oldest messages (drop-head) when queue exceeds this count
+    maxLengthBytes: 268435456   # 256 MiB — drop oldest messages when queue bodies exceed this size
 
 # ── Script Manager pod ────────────────────────────────────────────────────────
 # Trusted sidecar that owns all pod RBAC in the scripts namespace.

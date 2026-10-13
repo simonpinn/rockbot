@@ -227,14 +227,35 @@ Scores prompts using a keyword + length heuristic — no embeddings, no external
 
 - **Length score** (0 – 0.40) — longer prompts tend to be more complex
 - **Keyword score** (0 – 0.35) — high-signal words (`analyze`, `research`, `distributed`, …)
-  increase the score; simplex words (`what is`, `define`, `list the`, …) decrease it
+  increase the score; simplex words (`define`, `capital of`, `list the`, …) decrease it
 - **Structural score** (0 – 0.25) — code blocks, math notation, multi-step markers
 
 Scores at or below `lowCeiling` → Low; at or below `balancedCeiling` → Balanced; above → High.
 
+For **user messages**, thread state then raises the tier (#663). Each decision records the
+rule that decided it (`TierClassification.Rule`, logged as `rule=` and stored as
+`routingRule` in the routing log):
+
+| Rule | Effect |
+|---|---|
+| `score-band` / `high-gate` / `trivial-guard` | The score band, capped at Balanced without a complexity signal, or forced Low when trivial |
+| `active-thread-floor` | On an established thread, any non-trivial message routes at least Balanced (no length limit) |
+| `active-subagent-floor` | While the session has a subagent running, at least Balanced |
+| `balanced-floor-keyword` | A dream-learned floor keyword lifts Low to Balanced (#486) |
+| `research-question-floor` | A question naming a technical subject (acronym, version, spec/protocol/API) lifts Low to Balanced |
+| `inherited-tier` | At least the highest tier the session's last three turns earned on their own (within 30 min) — kept in the in-memory `SessionTierHistory` |
+| `trivial-ack` | A pure acknowledgement/greeting ("thanks", "ok", "👍") skipped the floors and stayed Low |
+
+A turn routed Low that makes a side-effecting tool call (by verb in the tool name — see
+`ToolSideEffects`) or hits two tool errors finishes its loop on Balanced
+(`TierEscalationContext`; logged as `Tier escalated Low→Balanced mid-turn: …`). Pinned tiers
+(`LLM:FixedTier`) are exempt from all of this.
+
 The parameterless constructor always uses compiled-in defaults (used in tests). The DI
 constructor hot-reloads `{BasePath}/tier-selector.json` every 60 seconds so thresholds and
-keyword lists can be tuned without a pod restart.
+keyword lists can be tuned without a pod restart. Keyword lists in the file are merged with
+the compiled defaults; retired low signals (`what is`, `what's`, `tell me about`, `look up`,
+`show me`, `i think`, …) are dropped from the merged list even when the file names them.
 
 ### `tier-selector.json` (hot-reloadable)
 
@@ -245,7 +266,7 @@ keyword lists can be tuned without a pod restart.
   "lowCeiling": 0.15,
   "balancedCeiling": 0.46,
   "highSignalKeywords": ["analyze", "research", "distributed", "..."],
-  "lowSignalKeywords":  ["what is", "define ", "list the", "..."]
+  "lowSignalKeywords":  ["define", "list the", "..."]
 }
 ```
 
@@ -315,13 +336,116 @@ agent process. Every message handler (`UserMessageHandler`, `ScheduledTaskHandle
    call evaluates whether the response actually completes the original user request. If
    incomplete, a continuation nudge is appended and the tool loop re-enters (up to
    `MaxCompletionReprompts` times, default 2). Evaluation is skipped on force-termination
-   (consecutive timeouts) and fails open on any evaluator error.
+   (consecutive timeouts) and fails open on any evaluator error. See
+   [When the completion evaluator runs](#when-the-completion-evaluator-runs).
 5. **Proactive follow-up** — after the completion evaluator says COMPLETE, a second
    `ModelTier.Low` call assesses whether there are high-value proactive actions the agent
    could take within the current context (e.g. looking up a contact mentioned in conversation,
    cross-referencing calendar events, connecting related information). If found, context is
    enriched with relevant skills/services and the tool loop runs one more pass. The follow-up
    response is appended to the original. Skipped for simple exchanges. Fails open on error.
+
+### When the completion evaluator runs
+
+The evaluator is one `ModelTier.Low` call, so `RunAsync` gates it (`CompletionEvalTriggers.Decide`,
+#666). It runs when any trigger below fires, and logs
+`Completion evaluator: RUN (trigger=<name>)`; otherwise it logs `SKIPPED (…, no trigger)`.
+Triggers are checked in this order, and the first match is logged:
+
+| Trigger | Fires when |
+|---|---|
+| `subagent-synthesis` | The loop relays a subagent's result (`SubagentResultHandler`). It's judged against the user request that led to the spawn. |
+| `promise-no-action` | The loop made no tool calls and the reply promises or describes work: "I should have…", "I'm cutting it… now", "I've got the right path", "I'll search…", or a closing "Let me…". |
+| `bare-claim` | The reply opens with a bare completion claim such as "Done." or "Updated.". |
+| `imperative-no-tools` | The loop made no tool calls and the user gave an instruction ("do it", "go ahead", "figure out…", "can you trim it?") or pushed back ("why didn't you…", "30 slides is a lot", "try again"). |
+| `side-effect` | The loop made a side-effecting tool call. `ToolSideEffects` decides this from the verb in the tool name; for `mcp_invoke_tool` it reads the `tool_name` argument. A batch tool such as `spawn_wisps` counts when any call it made on the agent's behalf is side-effecting (#686). |
+| `claimed-change` | The reply claims anywhere in it that something was created, updated, sent, scheduled or verified ("I have also updated…", "Scheduled and verified seven…", "has been created"), and no call in the loop changed anything (#686). |
+| `pattern` | The pre-#666 gate: the hallucinated-action or capability-denial regex matched, the reply is under 20 characters (unless the user only said "thanks", "ok" or "hi"), or the loop hit its iteration cap. |
+
+The agent's own bookkeeping (task list, working memory, long-term memory, progress reports)
+doesn't count as a tool call for the "no tool calls" triggers, and it isn't a side effect. A loop
+that calls `spawn_subagent` or `invoke_agent` is still skipped, because its results arrive later.
+The loop records its tool calls in `LoopToolCallLedger` instead of reading the chat history,
+because context trimming can shorten the history.
+
+A caller can pass `completionEvalTriggers` to enable only some triggers. The first enabled
+trigger that matches wins, so a disabled one never hides a later enabled one. `SubagentRunner`
+enables `side-effect`, `bare-claim` and `claimed-change` (#686). A subagent's own claims of work
+are then checked before its result is relayed, and nothing pushes it to do more than its task.
+
+**Outcomes of batch tools (#686).** A batch tool's result stays a non-error even when part of its
+work failed. This keeps the model from re-running the parts that worked. The tool reports its real
+outcome through `ToolCallOutcomeContext`, a holder that the native and text-based paths bind
+around every tool call. `spawn_wisps` reports a failed outcome when any wisp failed (for example
+`6 of 7 wisps failed`), along with every call its wisps' steps made. The ledger and the tool-call
+log record the call as failed, together with that detail and the nested calls. The evaluator
+lists the nested calls under the call that made them as `↳` lines, each with its own outcome. A
+claimed count must match the successful calls.
+
+The evaluator reads the user's last three messages, the agent's previous message, every tool
+call the loop made (name, ok or failed, and whether it changed state), what the user asked for,
+and the reason the check is running. Its rubric asks five questions:
+
+1. What did the user ask for (counts, format, location, constraints)?
+2. Was it delivered?
+3. Does any number in the reply contradict the user's constraints?
+4. Do the tool calls support every action the reply claims?
+5. Did the reply promise work it could have done now?
+
+**What the user asked for (#683).** `CompletionEvalTriggers.ClassifyUserRequest` labels the
+request being judged `UserAskedFor: instruction` or `UserAskedFor: information-only`. It reuses
+the #666 `ImperativeInstructionRegex`; a bare "yes"/"sure"/"please" right after an agent message
+also counts as an instruction, and an unknown request keeps the full rubric. For a synthesis turn
+the request is the one behind the spawn (`OriginatingUserRequest`), otherwise the latest user
+message. When the request is information-only (it shares context, gives information or asks a
+question), questions 1–2 are skipped, except that a question asked must be answered. The reply is
+judged only on whether its facts and claims are supported and stated accurately (questions 3–5).
+"The user's goal implies more work" is never a reason for INCOMPLETE. Before this, a context-only
+message ("the talk doesn't exist yet") was judged INCOMPLETE for not delivering demos, and the
+re-prompt spawned a subagent nobody asked for.
+
+**Subagent evidence (#683).** A synthesis turn's own tool calls are usually only
+`get_from_working_memory`. Every honest relay of a subagent's writes and uploads therefore looked
+like an unsupported claim, and the re-prompt made the agent disown real work. Now:
+
+- `AgentLoopRunner.RunAsync` exposes its ledger on `LoopDiagnostics.ToolCallLedger`.
+- `SubagentRunner` carries a compact copy on `SubagentResultMessage.ToolCalls`
+  (`SubagentToolCallSummary`: name, ok/failed, changes-state, args up to 100 chars) and
+  `ToolCallCount`. The list holds at most 40 calls. Over the cap, failed and state-changing calls
+  are kept first, then other calls, then bookkeeping, newest first within each group.
+  Both properties are additive; results from an older build deserialize with `null`.
+- `SubagentResultHandler.BuildRelayedWork` adds the session-work-registry artifacts written by
+  that subagent's session or by the wisps and workers linked under it
+  (`ISessionWorkRegistry.IsSessionWithin`).
+- It passes the result to `RunAsync(relayedWork: …)`.
+
+The evaluator gets a section for each subagent: "Tool calls made by subagent `<id>` (the relayed
+work)". All of these sections share about 3,000 characters, and each subagent gets at least 500.
+When a section is over its share, state-changing and failed calls are kept first, and the section
+says how many calls were left out. The rubric says a relayed claim is supported when that
+subagent's calls show it. The agent's own calls are judged separately, only for what the agent
+says it did itself this turn. A claim that neither list supports is still INCOMPLETE. If a
+subagent made no tool calls, its section says so. If its result didn't report its calls (an
+older build), the section says "not reported", and the evaluator is told not to treat their
+absence as proof the work didn't happen.
+
+**Re-prompt (#683).** After an INCOMPLETE verdict, the re-prompt adds guidance specific to the
+trigger and to what the user asked for. For an information-only request it says to fix what was
+flagged and not to start unrequested work. For a synthesis turn it adds: "work the subagent's
+own tool calls show it did is real — do not disown it". The message starts with
+`[Internal completion check — not a message from the user]` and quotes the user's original
+message. It tells the model to reply to that message directly; that the user has not seen the
+draft; not to address or thank the user for feedback; not to say "you're right" or "you were
+right"; and not to mention the review. It is still sent in the user role, because the history
+ends on the assistant draft and some provider paths hoist or reject a trailing system message.
+The re-prompt budget is unchanged.
+
+`spawn_subagent` reads the user request of the loop that ran it from
+`OriginatingUserRequestContext`. The request is stored on `SubagentEntry` and carried on
+`SubagentResultMessage.OriginatingUserRequest`, so the synthesis turn's check sees what the user
+asked, not only how the primary agent described the task to the subagent.
+
+Every RUN, COMPLETE and INCOMPLETE log line includes `trigger=` and `userAskedFor=`.
 
 ### Completion evaluator configuration
 
@@ -336,12 +460,84 @@ agent process. Every message handler (`UserMessageHandler`, `ScheduledTaskHandle
 
 | Counter | Fires when |
 |---|---|
-| `rockbot.agent.completion_check.complete` | Evaluator says task is done |
-| `rockbot.agent.completion_check.incomplete` | Evaluator triggers a re-prompt |
+| `rockbot.agent.completion_check.complete` | Evaluator says task is done (tagged `rockbot.completion_check.trigger` and `rockbot.completion_check.user_asked_for`) |
+| `rockbot.agent.completion_check.incomplete` | Evaluator triggers a re-prompt (tagged `rockbot.completion_check.trigger` and `rockbot.completion_check.user_asked_for`), so a trigger with a high false-positive rate is visible |
 | `rockbot.agent.completion_check.skipped` | Evaluation skipped (force termination) |
 | `rockbot.agent.follow_up.triggered` | Follow-up evaluator found an opportunity |
 | `rockbot.agent.follow_up.none` | Follow-up evaluator found nothing worth doing |
 | `rockbot.agent.follow_up.skipped` | Follow-up evaluation skipped (disabled, force term) |
+| `rockbot.agent.consequential_action.gated` | The consequential-action gate refused an external change (tagged `rockbot.tool.name` and `rockbot.action_gate.origin`) |
+
+### Consequential-action gate
+
+A user message that only shares context ("here's the abstract; the talk doesn't exist yet") must
+not lead to real calendar events, sent mail or uploads (#685). Before #685 the persona's
+"proactive" directives did exactly that, through a subagent and its wisps, and the evaluator
+(correctly) judged only the reply's facts. The gate separates *noticing* (always fine) from
+*changing an external system* (needs a request).
+
+**What is gated.** `ConsequentialActions.IsConsequential` — a call is consequential when
+`ToolSideEffects` says it writes **and** it reaches an MCP server (`mcp_invoke_tool`, judged by its
+`tool_name`, or a typed `{server}__{tool}` wrapper), or it creates or cancels one of the agent's
+scheduled tasks (`schedule_task`, `cancel_scheduled_task` — automation that would later act
+unasked), or it is listed in `AgentHost:ConsequentialActionGate:ExternalTools`. Everything else is
+agent-local and never gated: `file_*` on the agent's volume (`drafts/`), working and long-term
+memory, the task list, skills, rules, progress reports, sandboxed scripts, and delegation itself
+(`spawn_subagent`, `spawn_wisps`, `spawn_workers`, `invoke_agent`) — the gate applies to what the
+delegate does. Reads (`list_events`, `get_message`, …) always run.
+
+**When it refuses.** Every run has an `ActionGateScope(RunOrigin, UserAskedFor)`, bound to the async
+flow by `RunAsync` (`ActionGateContext`):
+
+| Origin | Set by | External changes |
+|---|---|---|
+| `UserTurn` | `UserMessageHandler`, `UserFeedbackHandler`; a synthesis turn (`SubagentResultHandler`) relaying a user-turn subagent | Only when the originating request is an `instruction` |
+| `SubagentOfUserTurn` | `SubagentManager` captures the spawning run's scope at spawn; `SubagentRunner` passes it on | Inherits the spawning turn's classification |
+| `Scheduled` | `ScheduledTaskHandler` (scheduled tasks, patrol) | Allowed — the user configured it |
+| `A2A` | `RockBotTaskHandler`, `ResearchAgentTaskHandler` (inbound tasks) | Allowed |
+| `Unknown` | Any caller that passes nothing and is not nested in another run | Allowed (pre-#685 behaviour) |
+
+A run that passes no scope and runs inside another run's tool call — a wisp LLM step, a worker —
+inherits the enclosing scope. For a user turn, the classification is the one the completion
+evaluator uses: `ClassifyUserRequest(latest user message, followsAgentMessage)`, so "yes", "sure"
+or "go ahead" right after an agent proposal counts as an instruction. A subagent keeps the
+*user's* classification; its own imperative task description doesn't launder an information-only
+message. `SubagentResultMessage.RunOrigin` / `.UserAskedFor` carry the scope back, so the synthesis
+turn runs under the same gate (`ActionGateScope.FromRelayedResults`; siblings that disagree resolve
+to instruction; results from an older build keep the old behaviour).
+
+**Where it checks.** `ActionGateContext.Check(tool, args)` runs at every dispatch site:
+`RockBotFunctionInvokingChatClient.InvokeFunctionAsync` (native path), both dispatch sites of the
+text-based loop, and `WispExecutor`'s direct steps. A refused call is not executed. Its tool result
+is:
+
+> Not run: calendar-mcp__create_event would change calendar-mcp but the user did not ask for that.
+> Propose it to the user in one sentence (what, when, where) and wait for them to ask. Do not retry
+> this call or route it through another tool.
+
+The call is recorded in the run's ledger as failed (so it neither counts as a side effect nor
+shows as relayed work that happened), logged at Information as
+`Consequential action gated: <tool> (originating request: information-only, origin=<origin>)`,
+and counted on `rockbot.agent.consequential_action.gated`. A refused wisp step fails with category
+`Judgment`.
+
+**Evaluator backstop.** For a run that needs an instruction and an information-only request, any
+*successful* external change in the loop's calls or a relayed subagent's calls is listed under
+"External changes the user did not ask for", and the rubric makes that INCOMPLETE ("unrequested
+external change: …"). The re-prompt then says to make no further external changes and to tell the
+user plainly what was changed and where, so they can keep or undo it. With the gate on, this
+should rarely fire.
+
+**Configuration.** `AgentHost:ConsequentialActionGate:Enabled` (default `true`; env
+`AgentHost__ConsequentialActionGate__Enabled=false` turns the gate off) and
+`AgentHost:ConsequentialActionGate:ExternalTools` (native tool names to gate like MCP writes;
+default empty).
+
+**Time conversion.** The same incident relayed 09:45 Amsterdam on 2026-10-28 as 2:45 AM Chicago
+(it is 3:45 — Europe left summer time on Oct 25, the US does on Nov 1). The `convert_time`
+registry tool (`RockBot.Tools.TimeConversion`, registered by `AddTimeTools()`) converts a wall-clock
+time between IANA zones with the DST rules of that date and reports both UTC offsets;
+`common-directives.md` tells every rung to use it instead of doing the arithmetic.
 
 ---
 
@@ -501,7 +697,7 @@ When the agent process starts:
 
 1. `AgentHostBuilder.Build()` registers all services with the DI container
 2. `IHostedService` implementations start in registration order:
-   - `StarterSkillService` — seeds starter skills from registered `IToolSkillProvider`s
+   - `StarterSkillService` — seeds and re-syncs the code-owned starter skills from registered `IToolSkillProvider`s
    - `McpBridgeService` — connects to configured MCP servers
    - `FileConversationMemory` — reloads sessions within `SessionIdleTimeout`
    - `SessionSummaryService` — begins polling for sessions to evaluate
@@ -523,7 +719,8 @@ Key configuration sections (from `appsettings.json` or environment variables):
   "AgentHost": {
     "MaxToolIterations": 50,
     "MaxCompletionReprompts": 2,
-    "MaxFollowUpPasses": 1
+    "MaxFollowUpPasses": 1,
+    "ConsequentialActionGate": { "Enabled": true, "ExternalTools": [] }
   },
   "RabbitMq": {
     "HostName": "rabbitmq.cluster.local",

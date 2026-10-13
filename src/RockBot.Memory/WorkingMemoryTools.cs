@@ -25,14 +25,33 @@ public sealed class WorkingMemoryTools
     private readonly string _namespace;
     private readonly ILogger _logger;
     private readonly TimeSpan? _minimumTtl;
+    private readonly WorkingMemoryOptions _options;
+    private readonly string _writer;
+    private readonly TimeProvider _time;
 
+    /// <param name="workingMemory">The backing store.</param>
+    /// <param name="namespace">Prefix prepended to plain keys on write.</param>
+    /// <param name="logger">Logger.</param>
+    /// <param name="minimumTtl">Optional TTL floor for background contexts.</param>
+    /// <param name="options">
+    /// Snapshot-prefix and stale-after settings for read provenance (issue #668). Defaults to
+    /// a fresh <see cref="WorkingMemoryOptions"/> when not supplied.
+    /// </param>
+    /// <param name="writer">
+    /// Identity recorded on every save and shown on read. Defaults to <paramref name="namespace"/>.
+    /// </param>
+    /// <param name="timeProvider">Clock for age rendering; tests pin it.</param>
     public WorkingMemoryTools(IWorkingMemory workingMemory, string @namespace, ILogger logger,
-        TimeSpan? minimumTtl = null)
+        TimeSpan? minimumTtl = null, WorkingMemoryOptions? options = null, string? writer = null,
+        TimeProvider? timeProvider = null)
     {
         _workingMemory = workingMemory;
         _namespace = @namespace;
         _logger = logger;
         _minimumTtl = minimumTtl;
+        _options = options ?? new WorkingMemoryOptions();
+        _writer = string.IsNullOrWhiteSpace(writer) ? @namespace : writer;
+        _time = timeProvider ?? TimeProvider.System;
 
         // Names are pinned explicitly rather than inherited from the method names:
         // AIFunctionFactory would register these as PascalCase, while every prompt and
@@ -91,24 +110,113 @@ public sealed class WorkingMemoryTools
         // (write proceeds; tag added so the dream service can later evaluate promotion).
         var (gatedTags, hint) = ObservationLanguageDetector.ApplySoftGate(data, tagList);
 
-        await _workingMemory.SetAsync(fullKey, data, ttl, category, gatedTags);
+        await _workingMemory.SetAsync(fullKey, data, ttl, category, gatedTags, _writer);
         return $"Saved to working memory under key '{fullKey}'.{ttlNote}{hint}";
     }
 
     [Description("Retrieve previously cached data from working memory by key. " +
                  "Use a plain key (e.g. 'emails_inbox') to retrieve from your own namespace, " +
-                 "or a full path (e.g. 'subagent/task1/results') to read from another namespace.")]
+                 "or a full path (e.g. 'subagent/task1/results') to read from another namespace. " +
+                 "The result starts with a header saying when the entry was stored and by whom. " +
+                 "Patrol snapshots (shared/patrol/...) are point-in-time copies, not live state — " +
+                 "for current todos, calendar, or mail, call the live tool and prefer it.")]
     public async Task<string> GetFromWorkingMemory(
         [Description("Key to retrieve — plain key for own namespace, full path for cross-namespace (e.g. 'subagent/task1/results')")] string key)
     {
         _logger.LogInformation("Tool call: GetFromWorkingMemory(key={Key})", key);
         // If the key contains '/', treat as an absolute path; otherwise prepend namespace.
         var fullKey = key.Contains('/') ? key : $"{_namespace}/{key}";
-        var value = await _workingMemory.GetAsync(fullKey);
+
+        // Prefer the entry with its metadata; stores that cannot supply it still return the
+        // bare value, which renders with "stored at unknown" rather than no header at all.
+        var entry = await _workingMemory.GetEntryAsync(fullKey);
+        var value = entry?.Value ?? await _workingMemory.GetAsync(fullKey);
         if (value is null)
-            return $"Working memory entry '{fullKey}' not found or has expired.";
-        return value;
+            return $"Working memory entry '{fullKey}' not found or has expired." + await BuildSubagentMissHintAsync(fullKey);
+
+        var header = WorkingMemoryProvenance.BuildHeader(fullKey, entry, _time.GetUtcNow(), _options);
+        return $"{header}\n{value}";
     }
+
+    /// <summary>Most keys a miss hint names before summarising the rest as a count.</summary>
+    private const int MissHintMaxKeys = 15;
+
+    /// <summary>Most other subagent namespaces a miss hint lists when the task id itself is wrong.</summary>
+    private const int MissHintMaxNamespaces = 5;
+
+    /// <summary>
+    /// For a miss under <c>subagent/&lt;id&gt;/</c> (#665): the keys that do exist under that task, or —
+    /// when the task has none, usually because a key name was copied from a different task — the
+    /// same-named key under another task and the recent subagent namespaces. Empty otherwise.
+    /// </summary>
+    private async Task<string> BuildSubagentMissHintAsync(string fullKey)
+    {
+        const string SubagentPrefix = "subagent/";
+        if (!fullKey.StartsWith(SubagentPrefix, StringComparison.OrdinalIgnoreCase))
+            return string.Empty;
+
+        var parts = fullKey.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+            return string.Empty;
+        var taskNamespace = $"{SubagentPrefix}{parts[1]}";
+        var leaf = parts.Length > 2 ? parts[^1] : null;
+
+        try
+        {
+            var siblings = await _workingMemory.ListAsync(taskNamespace + "/");
+            if (siblings.Count > 0)
+                return $" Keys that do exist under '{taskNamespace}': {FormatKeys(siblings.Select(e => e.Key))}. " +
+                       "Use one of these exact keys.";
+
+            var all = await _workingMemory.ListAsync(SubagentPrefix);
+            if (all.Count == 0)
+                return $" Nothing is stored under '{taskNamespace}', and no subagent outputs are in working memory right now.";
+
+            var sb = new StringBuilder($" Nothing is stored under '{taskNamespace}' — check the task id.");
+            if (leaf is not null)
+            {
+                var sameName = all
+                    .Where(e => e.Key.EndsWith("/" + leaf, StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(e => e.StoredAt)
+                    .Select(e => $"'{e.Key}'")
+                    .Take(3)
+                    .ToList();
+                if (sameName.Count > 0)
+                    sb.Append($" A key with that name exists under another task: {string.Join(", ", sameName)}.");
+            }
+
+            var namespaces = all
+                .GroupBy(e => string.Join('/', e.Key.Split('/').Take(2)), StringComparer.OrdinalIgnoreCase)
+                .OrderByDescending(g => g.Max(e => e.StoredAt))
+                .Take(MissHintMaxNamespaces)
+                .Select(g => $"{g.Key} ({FormatKeys(g.Select(e => e.Key), maxKeys: 3)})");
+            sb.Append($" Recent subagent namespaces: {string.Join("; ", namespaces)}.");
+            return sb.ToString();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "Could not build the subagent miss hint for {Key}", fullKey);
+            return string.Empty;
+        }
+    }
+
+    /// <summary>Quoted keys, bulk web/tool chunk keys counted rather than listed.</summary>
+    private static string FormatKeys(IEnumerable<string> keys, int maxKeys = MissHintMaxKeys)
+    {
+        var all = keys.ToList();
+        var named = all.Where(k => !IsBulkChunkKey(k)).ToList();
+        var chunkCount = all.Count - named.Count;
+        var text = string.Join(", ", named.Take(maxKeys).Select(k => $"'{k}'"));
+        if (named.Count > maxKeys)
+            text += $" (+{named.Count - maxKeys} more)";
+        if (chunkCount > 0)
+            text += (text.Length > 0 ? ", plus " : string.Empty) + $"{chunkCount} web/tool chunk key(s)";
+        return text;
+    }
+
+    private static bool IsBulkChunkKey(string key) =>
+        System.Text.RegularExpressions.Regex.IsMatch(key, @"-(chunk\d+|index)$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     [Description("Change part of a cached working memory entry without re-sending the whole payload. " +
                  "Use this to amend a running draft, checklist, or handoff note in place — re-saving it with " +
@@ -210,7 +318,7 @@ public sealed class WorkingMemoryTools
                    RecallTools.LookElsewhere(RecallTools.WorkingMemory);
         }
 
-        var now = DateTimeOffset.UtcNow;
+        var now = _time.GetUtcNow();
         var sb = new StringBuilder();
         var desc2 = BuildSearchDesc(query, category, tags);
         sb.AppendLine(isListing
@@ -225,6 +333,8 @@ public sealed class WorkingMemoryTools
             sb.Append($"- {entry.Key} (expires in {remainingStr}");
             if (entry.Category is not null) sb.Append($", category: {entry.Category}");
             if (entry.Tags is { Count: > 0 }) sb.Append($", tags: {string.Join(", ", entry.Tags)}");
+            sb.Append($", {WorkingMemoryProvenance.Describe(entry, now)}");
+            sb.Append(WorkingMemoryProvenance.SnapshotMarker(entry, now, _options));
 
             if (isListing)
             {

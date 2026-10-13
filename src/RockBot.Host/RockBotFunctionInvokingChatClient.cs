@@ -14,6 +14,8 @@ namespace RockBot.Host;
 /// Subclass of <see cref="FunctionInvokingChatClient"/> that preserves the infrastructure
 /// <see cref="AgentLoopRunner"/> previously provided for native tool-calling models:
 /// progress notifications, consecutive timeout detection, and context overflow recovery.
+/// Its inner client is wrapped in <see cref="TypedToolSurfaceChatClient"/>, so typed tools a
+/// session activates mid-loop are offered, and callable, on the loop's next iteration.
 /// </summary>
 public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
 {
@@ -39,7 +41,7 @@ public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
         LlmCostEstimator costEstimator,
         IWorkingMemory workingMemory,
         IOptions<AgentHostOptions> hostOptions,
-        ILogger logger) : base(innerClient)
+        ILogger logger) : base(new TypedToolSurfaceChatClient(innerClient))
     {
         _progressNotifier = progressNotifier;
         _toolCallLog = toolCallLog;
@@ -63,6 +65,26 @@ public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
 
         _logger.LogInformation("Executing tool {Name}(callId={CallId}, args={Args})",
             callContent.Name, callContent.CallId, argsSummary ?? "(none)");
+
+        // #685: an external change the user did not ask for is refused, not run. The refusal is
+        // the tool result, recorded as a failed call so the evaluator and relays don't count it.
+        if (ActionGateContext.Check(callContent.Name, argsSummary) is { } refusal)
+        {
+            ToolDiagnostics.Invocations.Add(1,
+                new KeyValuePair<string, object?>("rockbot.tool.name", callContent.Name),
+                new KeyValuePair<string, object?>("rockbot.tool.status", AgentLoopRunner.ConsequentialActionGatedStatus));
+            if (LoopDiagnosticsContext.Value is { } diagGated)
+            {
+                diagGated.ToolCalls++;
+                diagGated.LastToolName = callContent.Name;
+                diagGated.LastToolStatus = AgentLoopRunner.ConsequentialActionGatedStatus;
+                diagGated.LastToolResult = refusal;
+            }
+            LoopToolCallLedgerContext.Value?.Record(
+                callContent.Name, AgentLoopRunner.TruncateLedgerArgs(argsSummary), succeeded: false,
+                rawArguments: callContent.Arguments);
+            return refusal;
+        }
 
         // Temporary diagnostic — per-tool-call context size for patrol/* sessions so we
         // can see growth across FICC's internal iterations (this override is the only
@@ -159,9 +181,17 @@ public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
             diagPre.LastToolStatus = "in-flight";
         }
 
+        // Mid-turn tier escalation (#663): a side-effecting call on a Low run moves the
+        // loop's remaining iterations to Balanced (see TierEscalatingChatClient).
+        TierEscalationContext.Value?.ObserveToolCall(callContent.Name, callContent.Arguments);
+
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var status = "ok";
         object? result;
+        // #686: a batch tool reports failures of the work it ran (and the calls it made) here,
+        // since its result is deliberately not an error.
+        var outcome = new ToolCallOutcome();
+        using var outcomeScope = ToolCallOutcomeContext.Set(outcome);
         try
         {
             result = await base.InvokeFunctionAsync(context, cancellationToken);
@@ -200,6 +230,10 @@ public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
                 diagEx.LastToolStatus = status;
                 diagEx.LastToolResult = $"Error: {ex.Message}";
             }
+            TierEscalationContext.Value?.ObserveToolResult(callContent.Name, isError: true);
+            LoopToolCallLedgerContext.Value?.Record(
+                callContent.Name, AgentLoopRunner.TruncateLedgerArgs(argsSummary), succeeded: false,
+                rawArguments: callContent.Arguments, outcome: outcome);
             throw;
         }
         sw.Stop();
@@ -237,6 +271,18 @@ public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
         {
             status = ToolError.Codes.ExecutionFailed;
         }
+
+        // #686: a batch tool whose result is not an error but whose work partly failed (spawn_wisps
+        // with aborted wisps) is a failed call for the ledger, the log and the evaluator. The
+        // result the model sees is unchanged, so it does not re-run the parts that worked.
+        if (status == "ok" && outcome.Succeeded == false)
+        {
+            status = ToolError.Codes.ExecutionFailed;
+            _logger.LogInformation("Tool {Name} reported a failed outcome: {Detail}",
+                callContent.Name, outcome.Detail ?? "(no detail)");
+        }
+
+        TierEscalationContext.Value?.ObserveToolResult(callContent.Name, isError: status != "ok");
 
         // Track consecutive identical (tool, args, result) triples to detect stuck loops.
         if (_repetitiveCallDetector.Track(callContent.Name, argsSummary ?? string.Empty, resultStr ?? string.Empty))
@@ -303,6 +349,9 @@ public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
                 ? resultStr[..500] + "…"
                 : resultStr;
         }
+        LoopToolCallLedgerContext.Value?.Record(
+            callContent.Name, AgentLoopRunner.TruncateLedgerArgs(argsSummary), succeeded: status == "ok",
+            rawArguments: callContent.Arguments, outcome: outcome);
 
         // Log tool-call event for sequence analysis (fire-and-forget)
         if (_toolCallLog is not null && ToolCallSessionContext.SessionId is { } sid)
@@ -313,7 +362,12 @@ public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
                 ArgumentsSummary: argsSummary,
                 Succeeded: status == "ok",
                 DurationMs: (int)sw.ElapsedMilliseconds,
-                Timestamp: DateTimeOffset.UtcNow));
+                Timestamp: DateTimeOffset.UtcNow)
+            {
+                ErrorMessage = outcome.Succeeded == false ? outcome.Detail : null,
+                Detail = outcome.Detail,
+                NestedCalls = ToolCallOutcome.FormatNested(outcome.NestedSnapshot()),
+            });
         }
 
         if (_progressNotifier is not null)

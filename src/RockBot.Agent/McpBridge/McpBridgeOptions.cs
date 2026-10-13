@@ -26,6 +26,13 @@ public sealed class McpBridgeOptions
     public int MaxTimeoutMs { get; set; } = 900_000;
 
     /// <summary>
+    /// Longest text resource, in characters, that <c>mcp_read_resource</c> returns inline (#617).
+    /// Longer text is saved to the shared volume and returned as a path, as binary resources
+    /// always are.
+    /// </summary>
+    public int ResourceInlineTextLimit { get; set; } = 32_000;
+
+    /// <summary>
     /// When true, the bridge calls the LLM to generate a one-sentence summary of each
     /// connected server's capabilities before publishing <see cref="McpServersIndexed"/>.
     /// Falls back to a simple tool-list summary if the LLM is unavailable or the call fails.
@@ -59,11 +66,35 @@ public sealed class McpBridgeOptions
     public int ConfigPollIntervalSeconds { get; set; } = 5;
 
     /// <summary>
+    /// How often, in seconds, each connected server's tool and prompt lists are re-read to catch
+    /// a surface change the server didn't announce with list_changed. Checked on the reconnect
+    /// sweep, so it only runs when <see cref="ReconnectSweepIntervalSeconds"/> is positive.
+    /// 0 disables. A changed surface is published; an unchanged one publishes nothing.
+    /// </summary>
+    public int SurfaceRefreshIntervalSeconds { get; set; } = 300;
+
+    /// <summary>
     /// Elicitation policy applied to every server that does not declare its own
     /// <c>elicitation</c> block. The default answers form-mode questions from the in-flight
     /// tool call; set <c>Mode</c> to <c>decline</c> or <c>off</c> to tighten it fleet-wide.
     /// </summary>
     public McpElicitationConfig DefaultElicitation { get; set; } = new();
+
+    /// <summary>
+    /// Most questions handed back (<c>"mode": "handback"</c>) that one session can have waiting
+    /// at once. Past this, a server's new question for the session is declined in-band.
+    /// </summary>
+    public int MaxPendingQuestionsPerSession { get; set; } = 5;
+
+    /// <summary>Most handed-back questions, and so parked calls, the bridge holds at once.</summary>
+    public int MaxPendingQuestions { get; set; } = 50;
+
+    /// <summary>
+    /// The durable ledger of handed-back questions, which lets a restarted bridge tell each
+    /// session about the calls a restart interrupted. A relative path resolves next to
+    /// <see cref="ConfigPath"/>. Default <c>mcp/pending-questions.json</c> beside <c>mcp.json</c>.
+    /// </summary>
+    public string PendingLedgerPath { get; set; } = "mcp/pending-questions.json";
 
     /// <summary>
     /// Reads <c>DefaultElicitation:Defaults</c> from the bridge's configuration section.

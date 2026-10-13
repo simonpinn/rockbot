@@ -11,7 +11,7 @@ public sealed class McpServerIndex
     private List<McpServerSummary> _servers = [];
 
     /// <summary>
-    /// Whether the 5 management tools have been registered in <see cref="IToolRegistry"/>.
+    /// Whether the management tools have been registered in <see cref="IToolRegistry"/>.
     /// Stored here (singleton) because the handler is scoped (created per message).
     /// </summary>
     public bool ManagementToolsRegistered { get; set; }
@@ -19,6 +19,22 @@ public sealed class McpServerIndex
     public IReadOnlyList<McpServerSummary> Servers
     {
         get { lock (_lock) { return _servers; } }
+    }
+
+    /// <summary>A copy of the current summaries, safe to enumerate while updates arrive.</summary>
+    public IReadOnlyList<McpServerSummary> Snapshot()
+    {
+        lock (_lock) { return [.. _servers]; }
+    }
+
+    /// <summary>The current summary for <paramref name="serverName"/> (case-insensitive), or null.</summary>
+    public McpServerSummary? TryGet(string serverName)
+    {
+        lock (_lock)
+        {
+            return _servers.FirstOrDefault(s =>
+                string.Equals(s.ServerName, serverName, StringComparison.OrdinalIgnoreCase));
+        }
     }
 
     /// <summary>

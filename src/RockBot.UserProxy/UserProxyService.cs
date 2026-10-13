@@ -20,6 +20,9 @@ public sealed class UserProxyService(
     ILogger<UserProxyService> logger,
     Func<HttpClient>? httpClientFactory = null) : IHostedService
 {
+    // Per-run proxies (the CLI) mark their reply queues ephemeral so they don't outlive the process.
+    private SubscriptionOptions QueueOptions => new() { Ephemeral = options.EphemeralQueues };
+
     private readonly ConcurrentDictionary<string, (TaskCompletionSource<AgentReply> Tcs, IProgress<AgentReply>? Progress)> _pending = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<ConversationHistoryResponse>> _pendingHistory = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<AgentInfoResponse>> _pendingAgentInfo = new();
@@ -124,12 +127,14 @@ public sealed class UserProxyService(
                 UserResponseBroadcastTopic,
                 $"user-proxy.{options.ProxyId}",
                 HandleResponseAsync,
+                QueueOptions,
                 ct);
 
             p2p = await subscriber.SubscribeAsync(
                 UserResponsePointToPointTopic,
                 $"user-proxy.{options.ProxyId}.p2p",
                 HandleResponseAsync,
+                QueueOptions,
                 ct);
 
             _subscription = broadcast;
@@ -383,6 +388,22 @@ public sealed class UserProxyService(
     }
 
     /// <summary>
+    /// Publishes the user's answer to a handed-back MCP question shown as a form.
+    /// Fire-and-forget: the agent replies unsolicited once the resumed call finishes, and a
+    /// refusal comes back as an <see cref="McpQuestionStatus"/>.
+    /// </summary>
+    public async Task SendMcpAnswerAsync(
+        McpQuestionAnswer answer,
+        CancellationToken cancellationToken = default)
+    {
+        var envelope = answer.ToEnvelope<McpQuestionAnswer>(source: options.ProxyId);
+        await publisher.PublishAsync($"{UserProxyTopics.McpAnswer}.{options.AgentName}", envelope, cancellationToken);
+
+        logger.LogInformation("Published form {Action} for MCP question {QuestionId} in session {SessionId}",
+            answer.Decline ? "decline" : "answer", answer.QuestionId, answer.SessionId);
+    }
+
+    /// <summary>
     /// Sends a user message without waiting for a reply.
     /// </summary>
     public async Task SendFireAndForgetAsync(
@@ -443,6 +464,25 @@ public sealed class UserProxyService(
             catch (Exception ex)
             {
                 logger.LogWarning(ex, "Failed to handle AgentNameChanged notification");
+            }
+            return Task.FromResult(MessageResult.Ack);
+        }
+
+        // A handed-back MCP question shown as a form changed state.
+        if (envelope.MessageType == typeof(McpQuestionStatus).FullName)
+        {
+            try
+            {
+                var status = envelope.GetPayload<McpQuestionStatus>();
+                if (status is not null)
+                {
+                    logger.LogDebug("MCP question {QuestionId} is {State}", status.QuestionId, status.State);
+                    _ = frontend.OnMcpQuestionStatusAsync(status, ct);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to handle McpQuestionStatus notification");
             }
             return Task.FromResult(MessageResult.Ack);
         }
@@ -567,6 +607,7 @@ public sealed class UserProxyService(
                 HistoryResponseTopic,
                 $"user-proxy.{options.ProxyId}.history",
                 HandleHistoryResponseAsync,
+                QueueOptions,
                 ct);
 
             _historyInitialized = true;
@@ -640,6 +681,7 @@ public sealed class UserProxyService(
                 AgentInfoResponseTopic,
                 $"user-proxy.{options.ProxyId}.agent-info",
                 HandleAgentInfoResponseAsync,
+                QueueOptions,
                 ct);
 
             _agentInfoInitialized = true;
@@ -752,6 +794,7 @@ public sealed class UserProxyService(
                 ActiveStatusResponseTopic,
                 $"user-proxy.{options.ProxyId}.active-status",
                 HandleActiveStatusResponseAsync,
+                QueueOptions,
                 ct);
 
             _activeStatusInitialized = true;
@@ -1013,6 +1056,7 @@ public sealed class UserProxyService(
                 SaveResponseAckTopic,
                 $"user-proxy.{options.ProxyId}.save-response",
                 HandleSaveResponseAckAsync,
+                QueueOptions,
                 ct);
 
             _saveResponseInitialized = true;
@@ -1036,6 +1080,7 @@ public sealed class UserProxyService(
                 ListSavedResponsesTopic,
                 $"user-proxy.{options.ProxyId}.list-saved",
                 HandleListSavedResponseAsync,
+                QueueOptions,
                 ct);
 
             _listSavedInitialized = true;
@@ -1059,6 +1104,7 @@ public sealed class UserProxyService(
                 GetSavedResponseTopic,
                 $"user-proxy.{options.ProxyId}.get-saved",
                 HandleGetSavedResponseAsync,
+                QueueOptions,
                 ct);
 
             _getSavedInitialized = true;
@@ -1082,6 +1128,7 @@ public sealed class UserProxyService(
                 DeleteSavedAckTopic,
                 $"user-proxy.{options.ProxyId}.delete-saved",
                 HandleDeleteSavedAckAsync,
+                QueueOptions,
                 ct);
 
             _deleteSavedInitialized = true;
@@ -1421,6 +1468,7 @@ public sealed class UserProxyService(
                 UploadResponseTopic,
                 $"user-proxy.{options.ProxyId}.upload",
                 HandleUploadResponseAsync,
+                QueueOptions,
                 ct);
 
             _uploadInitialized = true;

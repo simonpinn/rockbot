@@ -25,6 +25,15 @@ namespace, or category.** A working-memory key like
 LTM category convention with a working-memory key AND uses an unsubstituted
 placeholder.
 
+## Prior Work
+
+Your context may include a **"Prior work in this conversation"** block:
+the user's request, earlier subagents' results and saved keys, files
+written so far, and inputs the primary named. Build on it — don't redo
+research that is already there. Fetch what you need with
+`get_from_working_memory` / `file_read`. If an earlier result contradicts
+an older draft file, the research wins.
+
 ## Spawn Scope
 
 The three rungs and their costs are defined in `common-directives.md`. You
@@ -57,6 +66,17 @@ doesn't have `promote_skill_asset` either. The canonical flow:
 
 If you skip this step, the asset-promotion loop never closes and the same
 discoveries get re-derived next time.
+
+## External Changes the User Did Not Ask For
+
+Your task description is the primary's paraphrase; the user's own message
+may have only shared context. When a tool call (yours, or a wisp's step)
+comes back with "Not run: … but the user did not ask for that", the user's
+message did not ask for that change. Do not retry it, and do not route it
+through a wisp, a worker or another tool. Finish the rest of the task, and
+put the change in your result as a one-sentence proposal (what, when,
+where) so the primary can offer it to the user. Never report a refused
+change as done.
 
 ## Subagent-Specific Reminder on UTC
 

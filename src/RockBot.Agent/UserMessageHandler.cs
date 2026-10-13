@@ -59,12 +59,16 @@ internal sealed class UserMessageHandler(
     ILogger<UserMessageHandler> logger,
     TierRoutingLogger tierRoutingLogger,
     ISkillUsageStore? skillUsageStore = null,
-    LlmTierOptions? llmTierOptions = null) : IMessageHandler<UserMessage>
+    LlmTierOptions? llmTierOptions = null,
+    IMcpSkillSurface? mcpSkillSurface = null,
+    IOptions<WorkingMemoryOptions>? workingMemoryOptions = null,
+    SessionTierHistory? tierHistory = null,
+    RockBot.Subagent.ISubagentManager? subagentManager = null) : IMessageHandler<UserMessage>
 {
     private static readonly TimeSpan ProgressMessageThreshold = TimeSpan.FromSeconds(5);
 
     // Heuristic for "thread is currently active" — controls whether the tier selector
-    // applies the short-message-on-active-thread override. Conservative enough to leave
+    // applies the active-thread Balanced floor (#383, widened by #663). Conservative enough to leave
     // first-turn and stale-session messages on the existing routing path. See #383.
     // Shared with AgentContextBuilder's recent-window query enrichment (#397) so both
     // read "the thread is live" the same way.
@@ -116,26 +120,42 @@ internal sealed class UserMessageHandler(
             message.UserId, message.SessionId, message.Content);
 
         // Establish whether this session already has an active topical thread, so
-        // the tier selector can route short follow-ups through Balanced instead of
+        // the tier selector can route follow-ups through Balanced instead of
         // Low. Read prior turns before AddTurnAsync runs (further below) so the
         // count reflects history, not the incoming message itself. See issue #383.
         var priorTurns = await conversationMemory.GetTurnsAsync(message.SessionId, ct);
         var threadEstablished = priorTurns.Count >= ThreadEstablishedMinTurns
             && (DateTimeOffset.UtcNow - priorTurns[^1].Timestamp) <= ThreadEstablishedRecency;
 
+        // Thread state beyond turn count (#663): the highest tier this session's recent turns
+        // routed to, and whether delegated work is still running for it. Keyword scoring sees
+        // only the message; these let "do that" on a heavy thread keep the thread's tier.
+        var recentMaxTier = tierHistory?.GetRecentMax(message.SessionId);
+        var activeSubagent = HasActiveSubagent(message.SessionId);
+
         var classification = tierSelector.Classify(
             message.Content,
-            new TierRoutingContext(Origin: "user-message", ThreadEstablished: threadEstablished));
+            new TierRoutingContext(
+                Origin: "user-message",
+                ThreadEstablished: threadEstablished,
+                RecentMaxTier: recentMaxTier,
+                ActiveSubagent: activeSubagent));
         var tier = classification.Tier;
         logger.LogInformation(
-            "Routing user message to tier={Tier} (score={Score:F3}, threadEstablished={ThreadEstablished})",
-            tier, classification.ComplexityScore, threadEstablished);
+            "Routing user message to tier={Tier} (rule={Rule}, score={Score:F3}, threadEstablished={ThreadEstablished}, " +
+            "recentMaxTier={RecentMaxTier}, activeSubagent={ActiveSubagent})",
+            tier, classification.Rule, classification.ComplexityScore, threadEstablished,
+            recentMaxTier?.ToString() ?? "none", activeSubagent);
         var turnSw = System.Diagnostics.Stopwatch.StartNew();
         var tierTag = new KeyValuePair<string, object?>("rockbot.llm.tier", tier.ToString());
 
         // Start the turn span. For background paths it outlives this method — we pass
         // it to the background task which disposes it when the final reply is published.
         var turnId = Guid.NewGuid().ToString("N")[..16];
+
+        // Record the tier this turn earned on its own (not an inherited one), so inheritance
+        // decays after a run of turns that don't earn it. Mid-turn escalation raises it below.
+        tierHistory?.Record(message.SessionId, turnId, classification.IntrinsicTier ?? tier);
         var modelId = registry.GetModelId(tier) ?? tier.ToString();
         var turnActivity = HostDiagnostics.Source.StartActivity("rockbot.turn");
         turnActivity?.SetTag("rockbot.llm.tier", tier.ToString());
@@ -200,21 +220,23 @@ internal sealed class UserMessageHandler(
                 if (File.Exists(sessionStartPath))
                 {
                     var sessionStartContent = await File.ReadAllTextAsync(sessionStartPath, ct);
-                    chatMessages.Insert(1, new ChatMessage(ChatRole.System, sessionStartContent));
+                    chatMessages.Insert(1, new ChatMessage(ChatRole.System, sessionStartContent).Tag(ContextCategory.SessionStart));
                     logger.LogInformation("Injected session-start directive for session {SessionId}", message.SessionId);
                 }
             }
 
             // Per-message working memory tools — namespace scoped to this session
             var sessionNamespace = $"session/{message.SessionId}";
-            var sessionWorkingMemoryTools = new WorkingMemoryTools(workingMemory, sessionNamespace, logger);
+            var sessionWorkingMemoryTools = new WorkingMemoryTools(workingMemory, sessionNamespace, logger,
+                options: workingMemoryOptions?.Value);
 
             // Per-turn attachment tool — attach_image stages files for this turn's final reply.
             var attachmentReplyTools = new AttachmentReplyTools(
                 attachmentStorage, attachmentBuffer, message.SessionId, turnId, logger);
 
             // Per-session skill tools with usage tracking
-            var sessionSkillTools = new SkillTools(skillStore, llmClient, logger, message.SessionId, skillUsageStore);
+            var sessionSkillTools = new SkillTools(skillStore, llmClient, logger, message.SessionId, skillUsageStore,
+            mcpSkillSurface: mcpSkillSurface);
 
             var batchId = Guid.NewGuid().ToString("N")[..12];
             var registryTools = toolRegistry.BuildAgentToolFunctions(
@@ -234,6 +256,10 @@ internal sealed class UserMessageHandler(
             {
                 Tools = allTools
             };
+
+            // Typed MCP tools this session activated on earlier turns (lazy mode, #612). The loop
+            // adds them too, but the text-based path's first request is made here, before it.
+            agentLoopRunner.AddSessionTools(chatOptions, tier);
 
             var toolNames = chatOptions.Tools!.OfType<AIFunction>().Select(t => t.Name).ToList();
             logger.LogInformation("Calling LLM with {ToolCount} tools: [{Tools}]",
@@ -348,6 +374,25 @@ internal sealed class UserMessageHandler(
                             chatMessages, chatOptions, firstResponse, classification, message.Content, postInjectionTokenEstimate,
                             message.SessionId, turnId, replyTo, correlationId, sessionHandle.Generation, wipMessageId, turnActivity, sessionCt);
                     }
+                    else if (CompletionEvalTriggers.NeedsCheckWithoutTools(text, message.Content))
+                    {
+                        // #666: a no-tool reply that promises work, claims "Done."/"Updated.", or
+                        // answers an instruction would otherwise go straight to the user without
+                        // the completion evaluator ever seeing it. Route it through the loop.
+                        logger.LogInformation(
+                            "First response needs a completion check (promise, bare claim, or instruction with no tool calls; {Length} chars); routing to background loop",
+                            text.Length);
+
+                        await PublishReplyAsync(
+                            "I'm working on that — I'll follow up shortly.",
+                            replyTo, correlationId, message.SessionId, turnId, isFinal: false, ct);
+
+                        turnActivityHandedOff = true;
+                        context.Items[WipConstants.DeferredKey] = true;
+                        _ = BackgroundToolLoopAsync(
+                            chatMessages, chatOptions, firstResponse, classification, message.Content, postInjectionTokenEstimate,
+                            message.SessionId, turnId, replyTo, correlationId, sessionHandle.Generation, wipMessageId, turnActivity, sessionCt);
+                    }
                     else
                     {
                         // Single-response text path (no background loop): firstResponse IS
@@ -361,6 +406,7 @@ internal sealed class UserMessageHandler(
                             ComplexityScore = classification.ComplexityScore,
                             MatchedHighKeywords = classification.MatchedHighKeywords,
                             MatchedLowKeywords = classification.MatchedLowKeywords,
+                            RoutingRule = classification.Rule,
                             PostInjectionTokenEstimate = postInjectionTokenEstimate,
                             ModelId = firstResponse.ModelId ?? registry.GetModelId(tier),
                             InputTokens = firstResponse.Usage?.InputTokenCount,
@@ -493,6 +539,7 @@ internal sealed class UserMessageHandler(
                 chatMessages, chatOptions, sessionId, tier: classification.Tier,
                 complexityScore: classification.ComplexityScore,
                 diagnostics: nativeDiag,
+                allowTierEscalation: AllowTierEscalation,
                 onPreToolCall: async (desc, ct2) =>
                 {
                     await PublishReplyAsync($"Working on it — checking {desc}…", replyTo, correlationId, sessionId, turnId, isFinal: false, ct2);
@@ -517,10 +564,16 @@ internal sealed class UserMessageHandler(
                     await PublishReplyAsync(stage, replyTo, correlationId, sessionId, turnId, isFinal: false, ct2);
                     lastProgressAt = DateTimeOffset.UtcNow;
                 },
-                cancellationToken: ct);
+                cancellationToken: ct,
+                // #685: external changes need this message (or the proposal it accepts) to ask for them.
+                actionGate: ActionGateScope.ForUserTurn,
+                // #670: rarely used tool families wait until the conversation loads them.
+                deferRareTools: true);
 
             logger.LogInformation(
                 "Native path complete — final text {TextLen} chars", text.Length);
+
+            RecordEscalation(sessionId, turnId, nativeDiag);
 
             _ = tierRoutingLogger.AppendAsync(new TierRoutingEntry
             {
@@ -531,6 +584,9 @@ internal sealed class UserMessageHandler(
                 ComplexityScore = classification.ComplexityScore,
                 MatchedHighKeywords = classification.MatchedHighKeywords,
                 MatchedLowKeywords = classification.MatchedLowKeywords,
+                RoutingRule = classification.Rule,
+                EscalatedTier = nativeDiag.EscalatedTier,
+                EscalationReason = nativeDiag.EscalationReason,
                 PostInjectionTokenEstimate = postInjectionTokenEstimate,
                 ModelId = nativeDiag.ModelId ?? registry.GetModelId(classification.Tier),
                 InputTokens = nativeDiag.InputTokens > 0 ? nativeDiag.InputTokens : null,
@@ -644,6 +700,7 @@ internal sealed class UserMessageHandler(
                 chatMessages, chatOptions, sessionId, firstResponse: firstResponse, tier: tier,
                 complexityScore: classification.ComplexityScore,
                 diagnostics: bgDiag,
+                allowTierEscalation: AllowTierEscalation,
                 onPreToolCall: async (desc, ct2) =>
                 {
                     await PublishReplyAsync($"Working on it — checking {desc}…", replyTo, correlationId, sessionId, turnId, isFinal: false, ct2);
@@ -668,7 +725,13 @@ internal sealed class UserMessageHandler(
                     await PublishReplyAsync(stage, replyTo, correlationId, sessionId, turnId, isFinal: false, ct2);
                     lastProgressAt = DateTimeOffset.UtcNow;
                 },
-                cancellationToken: ct);
+                cancellationToken: ct,
+                // #685: external changes need this message (or the proposal it accepts) to ask for them.
+                actionGate: ActionGateScope.ForUserTurn,
+                // #670: rarely used tool families wait until the conversation loads them.
+                deferRareTools: true);
+
+            RecordEscalation(sessionId, turnId, bgDiag);
 
             // Routing telemetry written here (terminal point) so the entry carries the
             // multi-iteration aggregate token usage accumulated across the whole loop.
@@ -681,6 +744,9 @@ internal sealed class UserMessageHandler(
                 ComplexityScore = classification.ComplexityScore,
                 MatchedHighKeywords = classification.MatchedHighKeywords,
                 MatchedLowKeywords = classification.MatchedLowKeywords,
+                RoutingRule = classification.Rule,
+                EscalatedTier = bgDiag.EscalatedTier,
+                EscalationReason = bgDiag.EscalationReason,
                 PostInjectionTokenEstimate = postInjectionTokenEstimate,
                 ModelId = bgDiag.ModelId ?? registry.GetModelId(tier),
                 InputTokens = bgDiag.InputTokens > 0 ? bgDiag.InputTokens : null,
@@ -782,6 +848,46 @@ internal sealed class UserMessageHandler(
             return (true, AgentLoopRunner.GetPreToolText(text));
 
         return (false, text);
+    }
+
+    /// <summary>
+    /// Mid-turn tier escalation (#663) applies to user turns unless the tier is pinned
+    /// (<c>LLM:FixedTier</c>): a pinned tier may hold a model chosen for a reason other than
+    /// capability, so it must not be swapped mid-loop.
+    /// </summary>
+    private bool AllowTierEscalation => tierSelector is not FixedTierSelector;
+
+    /// <summary>
+    /// True when a subagent spawned from <paramref name="sessionId"/> is still running.
+    /// Subagent entries carry the working-memory namespace form (<c>session/{id}</c>).
+    /// </summary>
+    private bool HasActiveSubagent(string sessionId)
+    {
+        if (subagentManager is null)
+            return false;
+
+        try
+        {
+            var ns = $"session/{sessionId}";
+            return subagentManager.ListActive().Any(e =>
+                string.Equals(e.PrimarySessionId, ns, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(e.PrimarySessionId, sessionId, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Could not list active subagents for session {SessionId}", sessionId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Raises this turn's entry in the session tier history when the loop escalated
+    /// mid-turn, so the next turns inherit the tier the work actually needed.
+    /// </summary>
+    private void RecordEscalation(string sessionId, string turnId, LoopDiagnostics diagnostics)
+    {
+        if (diagnostics.EscalatedTier is { } escalated)
+            tierHistory?.Raise(sessionId, turnId, escalated);
     }
 
     /// <summary>

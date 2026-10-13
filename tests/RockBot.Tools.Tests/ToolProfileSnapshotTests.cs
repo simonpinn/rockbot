@@ -28,7 +28,9 @@ public class ToolProfileSnapshotTests
         R("mcp_get_service_details", "mcp:management"),
         R("mcp_register_server", "mcp:management"),
         R("mcp_unregister_server", "mcp:management"),
-        // mcp:{server} (McpToolRegistrar — per-server source)
+        R("mcp_list_resources", "mcp:management"),
+        R("mcp_read_resource", "mcp:management"),
+        // mcp:{server} (McpWrapperCatalog typed wrappers, and the legacy McpToolRegistrar — per-server source)
         R("calendar__list_events", "mcp:calendar"),
         // scheduling (SchedulingToolRegistrar)
         R("create_scheduled_task", "scheduling"),
@@ -50,6 +52,8 @@ public class ToolProfileSnapshotTests
         R("spawn_worker", "worker"),
         // wisp (WispToolRegistrar)
         R("wisp_execute", "wisp"),
+        // time (TimeToolRegistrar, #685) — pure computation, admitted everywhere
+        R("convert_time", "time"),
     ];
 
     private static ToolRegistration R(string name, string source) =>
@@ -72,9 +76,12 @@ public class ToolProfileSnapshotTests
         [
             "browse_url",
             "calendar__list_events",
+            "convert_time",
             "mcp_get_service_details",
             "mcp_invoke_tool",
+            "mcp_list_resources",
             "mcp_list_services",
+            "mcp_read_resource",
             "read_file",
             "run_script",
             "service_search",

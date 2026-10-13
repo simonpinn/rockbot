@@ -1,5 +1,6 @@
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using RockBot.Host;
 using RockBot.Llm;
 using RockBot.Memory;
@@ -32,7 +33,11 @@ internal sealed class SubagentResultHandler(
     ISubagentManager subagentManager,
     ISessionTracker sessionTracker,
     SessionOriginStore originStore,
-    ILogger<SubagentResultHandler> logger) : IMessageHandler<SubagentResultMessage>
+    ILogger<SubagentResultHandler> logger,
+    IMcpSkillSurface? mcpSkillSurface = null,
+    SessionTierHistory? tierHistory = null,
+    ISessionWorkRegistry? sessionWorkRegistry = null,
+    IOptions<AgentHostOptions>? hostOptions = null) : IMessageHandler<SubagentResultMessage>
 {
     public async Task HandleAsync(SubagentResultMessage message, MessageHandlerContext context)
     {
@@ -55,6 +60,11 @@ internal sealed class SubagentResultHandler(
         var rawSessionId = sessionNamespace.StartsWith(SessionPrefix, StringComparison.OrdinalIgnoreCase)
             ? sessionNamespace[SessionPrefix.Length..]
             : sessionNamespace;
+
+        // A subagent result coming back into the thread means the thread carries delegated
+        // work: the user's next follow-ups inherit at least Balanced (#663). Balanced, not the
+        // subagent's own tier — a High research brief should not push every reply to High.
+        tierHistory?.Record(rawSessionId, $"subagent:{message.TaskId}", ModelTier.Balanced);
 
         // ── Phase 1: immediate per-result work (every result) ──────────────────
 
@@ -96,6 +106,41 @@ internal sealed class SubagentResultHandler(
               $"Keys: {string.Join(", ", whiteboardEntries.Select(e => $"'{e.Key}'"))}. " +
               "Retrieve and present them to the user using get_from_working_memory with the full key."
             : string.Empty;
+
+        // #670: once relayed, this result replays in history shortened to its start and end. Keep
+        // the full text in working memory so a later turn can still read it. Saved after the
+        // whiteboard hint is built, so the synthesis isn't told to fetch what it already has inline.
+        var relayCap = hostOptions?.Value.RelayedSubagentTurnMaxChars ?? new AgentHostOptions().RelayedSubagentTurnMaxChars;
+        if (relayCap > 0 && safeOutput.Length > relayCap)
+        {
+            try
+            {
+                await workingMemory.SetAsync(
+                    HistoryCompaction.SubagentOutputKey(message.TaskId), safeOutput,
+                    ttl: TimeSpan.FromHours(24), category: "subagent-output");
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogWarning(ex, "Failed to keep the full output of subagent {TaskId} in working memory", message.TaskId);
+            }
+        }
+
+        // #665: record the result in the conversation's work registry, so the next subagent this
+        // conversation spawns starts with it (and the primary's context names its keys).
+        try
+        {
+            sessionWorkRegistry?.RecordSubagentResult(sessionNamespace, SubagentWorkResult.Create(
+                message.TaskId,
+                message.Description ?? "(task description not recorded)",
+                safeOutput,
+                whiteboardEntries.Select(e => e.Key),
+                message.IsSuccess,
+                message.Timestamp));
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to record subagent {TaskId} in the session work registry", message.TaskId);
+        }
 
         // Add synthetic user turn to conversation memory.
         // On the failure path, explicitly point the primary at the structured
@@ -200,7 +245,8 @@ internal sealed class SubagentResultHandler(
         }
 
         var sessionWorkingMemoryTools = new WorkingMemoryTools(workingMemory, sessionNamespace, logger);
-        var sessionSkillTools = new SkillTools(skillStore, llmClient, logger, rawSessionId);
+        var sessionSkillTools = new SkillTools(skillStore, llmClient, logger, rawSessionId,
+            mcpSkillSurface: mcpSkillSurface);
         var registryTools = toolRegistry.GetTools()
             .Select(r => (AIFunction)new SubagentRegistryToolFunction(
                 r, toolRegistry.GetExecutor(r.Name)!, sessionNamespace))
@@ -221,9 +267,21 @@ internal sealed class SubagentResultHandler(
                 ReplyTo = $"{UserProxyTopics.UserResponse}.{agent.Name}"
             });
 
+            // #666: the synthesis is always checked by the completion evaluator, against the
+            // user request that led to the spawn — not just the subagent's self-report.
             var finalContent = await agentLoopRunner.RunAsync(
                 chatMessages, chatOptions, rawSessionId,
-                enableFollowUp: false, cancellationToken: ct);
+                enableFollowUp: false, cancellationToken: ct,
+                subagentSynthesis: true,
+                originatingUserRequest: CombineOriginatingRequests(batchedResults),
+                // #683: what each relayed subagent actually did, so the check doesn't read an honest
+                // relay of its writes and uploads as an unsupported claim.
+                relayedWork: BuildRelayedWork(batchedResults, sessionWorkRegistry, sessionNamespace),
+                // #685: the relay runs under the gate the subagent ran under — an information-only
+                // request doesn't become an instruction because a subagent reported back.
+                actionGate: ActionGateScope.FromRelayedResults(batchedResults),
+                // #670: the primary's own tool surface, rare families included only once loaded.
+                deferRareTools: true);
 
             await conversationMemory.AddTurnAsync(
                 rawSessionId,
@@ -298,6 +356,75 @@ internal sealed class SubagentResultHandler(
             logger.LogError(ex,
                 "Degraded subagent consolidation reply also failed for session {SessionId}",
                 rawSessionId);
+        }
+    }
+
+    /// <summary>
+    /// The user request(s) behind a batch of results, for the synthesis turn's completion check
+    /// (#666). Siblings spawned from one turn share a request, so duplicates collapse; distinct
+    /// requests are listed in arrival order. Null when no result carries one (e.g. results from
+    /// an older build, or a spawn made outside a user turn).
+    /// </summary>
+    internal static string? CombineOriginatingRequests(IReadOnlyList<SubagentResultMessage> results)
+    {
+        var distinct = results
+            .Select(r => r.OriginatingUserRequest?.Trim())
+            .Where(r => !string.IsNullOrEmpty(r))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        return distinct.Count switch
+        {
+            0 => null,
+            1 => distinct[0],
+            _ => string.Join("\n\n", distinct.Select((r, i) => $"({i + 1}) {r}")),
+        };
+    }
+
+    /// <summary>
+    /// The work of each subagent in a batch, for the synthesis turn's completion check (#683): the
+    /// tool calls its result carries, plus the files and uploads the session work registry recorded
+    /// for its session and the wisps and workers it ran. Never throws — the evidence is an aid.
+    /// </summary>
+    internal static IReadOnlyList<RelayedSubagentWork> BuildRelayedWork(
+        IReadOnlyList<SubagentResultMessage> results, ISessionWorkRegistry? registry, string primarySessionId)
+    {
+        IReadOnlyList<SessionArtifact> artifacts = [];
+        try
+        {
+            if (registry is not null)
+                artifacts = registry.GetSnapshot(primarySessionId).Artifacts;
+        }
+        catch
+        {
+            // Best-effort: the tool calls on the results are the main evidence.
+        }
+
+        return results.Select(r => new RelayedSubagentWork(
+            r.TaskId,
+            r.ToolCalls,
+            r.ToolCallCount,
+            ArtifactsWrittenBy(r, artifacts, registry))).ToList();
+    }
+
+    private static IReadOnlyList<string> ArtifactsWrittenBy(
+        SubagentResultMessage result, IReadOnlyList<SessionArtifact> artifacts, ISessionWorkRegistry? registry)
+    {
+        if (registry is null || artifacts.Count == 0) return [];
+        try
+        {
+            return artifacts
+                .Where(a => registry.IsSessionWithin(a.LastWriterSessionId, result.SubagentSessionId))
+                .Select(a => a.IsRemoteOnly
+                    ? $"uploaded to {a.RemoteTarget ?? a.Path} (by {a.LastTool})"
+                    : a.RemoteTarget is { Length: > 0 } remote
+                        ? $"{a.Path} (last change by {a.LastTool}; uploaded to {remote})"
+                        : $"{a.Path} (last change by {a.LastTool})")
+                .ToList();
+        }
+        catch
+        {
+            return [];
         }
     }
 

@@ -31,7 +31,9 @@ internal sealed class ScheduledTaskHandler(
     IOptions<AgentProfileOptions> profileOptions,
     IScheduledTaskStore scheduledTaskStore,
     ILogger<ScheduledTaskHandler> logger,
-    ISkillUsageStore? skillUsageStore = null) : IMessageHandler<ScheduledTaskMessage>
+    ISkillUsageStore? skillUsageStore = null,
+    IMcpSkillSurface? mcpSkillSurface = null,
+    IOptions<WorkingMemoryOptions>? workingMemoryOptions = null) : IMessageHandler<ScheduledTaskMessage>
 {
     public async Task HandleAsync(ScheduledTaskMessage message, MessageHandlerContext context)
     {
@@ -82,8 +84,10 @@ internal sealed class ScheduledTaskHandler(
         chatMessages.Add(new ChatMessage(ChatRole.User, message.Description));
 
         // Per-session tools — same set the user handler builds (sessionId already is "patrol/name")
-        var sessionWorkingMemoryTools = new WorkingMemoryTools(workingMemory, sessionId, logger);
-        var sessionSkillTools = new SkillTools(skillStore, llmClient, logger, sessionId, skillUsageStore);
+        var sessionWorkingMemoryTools = new WorkingMemoryTools(workingMemory, sessionId, logger,
+            options: workingMemoryOptions?.Value);
+        var sessionSkillTools = new SkillTools(skillStore, llmClient, logger, sessionId, skillUsageStore,
+            mcpSkillSurface: mcpSkillSurface);
         var taskDirectiveTools = new TaskDirectiveTools(scheduledTaskStore, message.TaskName, logger);
 
         var batchId = Guid.NewGuid().ToString("N")[..12];
@@ -132,7 +136,9 @@ internal sealed class ScheduledTaskHandler(
 
             finalText = await agentLoopRunner.RunAsync(
                 chatMessages, chatOptions, sessionId: sessionId,
-                enableFollowUp: false, cancellationToken: ct);
+                enableFollowUp: false, cancellationToken: ct,
+                // #685: user-configured automation keeps acting without a fresh request.
+                actionGate: ActionGateScope.ForScheduledTask);
             succeeded = true;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

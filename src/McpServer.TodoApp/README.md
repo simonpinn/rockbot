@@ -4,28 +4,75 @@ An MCP server providing a persistent to-do list accessible to AI agents via the 
 
 ## Tools
 
+The server also returns a short instructions string in the MCP `initialize` result (`ServerInstructions.cs`), for clients that connect directly rather than through the aggregator. Keep it consistent with `SKILL.md`.
+
+Client-facing usage guidance (conventions, recurrence semantics, workflows) lives in [`SKILL.md`](SKILL.md). It is published to the mcp-aggregator as the `todo-mcp` skill document; after editing it, re-publish it with the aggregator's `update_skill(serverName: "todo-mcp", markdown: ...)`.
+
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `add_task` | `title`, `due_date` (YYYY-MM-DD), optional `recurrence` (none/daily/weekly/monthly/quarterly/biannual/yearly), `description`, `recurrence_until`, `recurrence_count` | Adds a new task; returns created task as JSON |
-| `list_tasks` | optional `due_before`, `due_after` (YYYY-MM-DD) | Lists active tasks, optionally filtered by due date |
-| `complete_task` | `id` (GUID), optional `stop_recurrence` | Marks task complete; returns `{ completed, next, seriesEnded }` |
-| `delete_task` | `id` (GUID) | Removes task from active list |
-| `update_task` | `id`, optional `title`, `description`, `due_date`, `recurrence`, `recurrence_until`, `recurrence_count` | Updates fields on an active task; the id is preserved |
-| `list_completed` | optional `completed_after`, `completed_before` (ISO datetime) | Lists completed tasks |
+| `add_task` | `title`, `due_date` (YYYY-MM-DD), optional `recurrence` (none/daily/weekly/monthly/quarterly/biannual/yearly), `description`, `recurrence_until`, `recurrence_count`, `month_anchor` | Adds a new task; returns created task as JSON |
+| `list_tasks` | optional `due_before`, `due_after` (YYYY-MM-DD), `query`, `sort` (due_date/created_at/title), `compact` | Lists active tasks, sorted by due date by default; notes are summarized as `note_count` + `last_note` |
+| `get_task` | `id` | One task with full detail and all notes; returns `{ status, task }` (status `active` or `completed`) |
+| `add_task_note` | `id`, `text`, optional `source` | Appends a timestamped note to a task's activity log; returns the task with all notes |
+| `complete_task` | `id` (GUID), optional `stop_recurrence` | Marks task complete; returns `{ completed, next, series_ended }` |
+| `delete_task` | `id` (GUID) | Soft-deletes a task; returns its id, `deleted_at` and `purge_after` |
+| `restore_task` | `id` | Brings a deleted task back with its original id, notes and series |
+| `list_deleted` | — | Restorable deleted tasks, most recent first |
+| `uncomplete_task` | `id` | Moves a completed task back to active; removes its untouched next occurrence; returns `{ restored, removed_next }` |
+| `update_task` | `id`, optional `title`, `description`, `due_date`, `recurrence`, `recurrence_until`, `recurrence_count`, `month_anchor` | Updates fields on an active task; the id is preserved |
+| `list_completed` | optional `completed_after`, `completed_before` (ISO datetime), `query`, `sort` (completed_at/due_date/title), `compact` | Lists completed tasks, most recent first by default |
 
 ### Recurrence
 
 - Next-due is calculated from the original due date, not the completion date.
-- Every occurrence of a series shares a `seriesId` and carries its 1-based `occurrence` number. Tasks stored before series tracking existed get `seriesId = id` and start counting at 1.
+- Monthly, quarterly, biannual and yearly series have a `month_anchor`:
+  - `same_day` (default) repeats on the series' original day of the month (`anchor_day`). When a month is shorter, the occurrence lands on that month's last day, and the series returns to its anchor afterwards: Jan 31 → Feb 28 → Mar 31.
+  - `last_day` repeats on the last day of every month.
+  - Using `month_anchor` with none, daily or weekly is an error.
+  - `add_task(month_anchor: "last_day")` moves `due_date` to the end of its month.
+  - `update_task(month_anchor: "last_day")` does the same, unless `due_date` is also given.
+  - Tasks stored before anchors existed use their current due day as the anchor.
+- Every occurrence of a series shares a `series_id` and carries its 1-based `occurrence` number. Tasks stored before series tracking existed get `series_id = id` and start counting at 1.
 - A series ends when:
   - `complete_task` is called with `stop_recurrence: true`;
   - the next occurrence would exceed `recurrence_count` (total occurrences, counting the first);
   - the next due date would fall after `recurrence_until` (inclusive).
-- `complete_task` returns `next` (the new occurrence with its id, or `null`) and `seriesEnded` (`stop_recurrence` / `count_reached` / `until_reached`, or `null`).
+- `complete_task` returns `next` (the new occurrence with its id, or `null`) and `series_ended` (`stop_recurrence` / `count_reached` / `until_reached`, or `null`).
 - `update_task(recurrence: "none")` ends a series without deleting the task and clears its limits. `recurrence_until: ""` and `recurrence_count: 0` clear a single limit.
 - Setting a limit on a task whose recurrence is `none` is an error.
 
-Argument handling is strict: every tool's input schema declares `additionalProperties: false`, and a call that passes an argument the tool doesn't declare fails with an error naming the unknown key(s) instead of being silently ignored. All failures (unknown arguments, invalid ids or dates, task not found) are returned as MCP tool errors (`isError: true`).
+### Undo
+
+Deletes and completions can be undone, so callers can act on corrections without an extra confirmation round-trip.
+- **Delete:** `delete_task` moves the task to `/data/deleted.json`. `restore_task` brings it back unchanged until it is purged, `TodoApp:DeletedRetentionDays` days later (default 30). `get_task` reports a deleted task with `status: "deleted"`.
+- **Complete:** `uncomplete_task` restores a completed task with its id, notes and series settings.
+  - If completing it created a next occurrence, that occurrence is removed again, but only while it is untouched.
+  - The call fails, changing nothing, if the next occurrence was edited, given notes or completed since.
+
+### Finding tasks
+
+- `query` is a case-insensitive substring match against title and description.
+- `compact: true` returns only `id`, `title`, `due_date` and `recurrence` (plus `completed_at` for completed tasks). Use it for an overview, then `get_task` for detail.
+
+### Notes
+
+`description` holds the task's intent. Status updates, verification results and other agent observations go in the append-only notes log via `add_task_note`, not into `description`.
+- Each note records `at` (a server timestamp), `text`, and an optional `source` (e.g. `heartbeat-patrol`).
+- `list_tasks` omits the log, showing only `note_count` and `last_note`, so listings don't grow as notes accumulate.
+- Notes stay with the occurrence they were written on: they move to completed history (visible in `list_completed`) and don't carry over to the next occurrence.
+
+### Contract
+
+- Inputs and outputs are snake_case (`due_date`, `series_id`, `month_anchor`, ...). Enum values are lowercase: `biannual`, `same_day`.
+- `recurrence` and `month_anchor` are declared as JSON-schema `enum`s, so clients can validate before calling.
+- Tools carry MCP annotations:
+  - `list_tasks` and `list_completed` are read-only;
+  - `delete_task` is destructive;
+  - `update_task` is idempotent;
+  - none of the tools are open-world.
+- The persisted files under `/data` keep their original camelCase format; only the wire format is snake_case.
+
+Argument handling is strict: every tool's input schema declares `additionalProperties: false`, and a call that passes an argument the tool doesn't declare fails with an error naming the unknown key(s) instead of being silently ignored. An enum argument with a value outside its allowed list fails with an error listing the allowed values. All failures (unknown arguments, invalid ids or dates, task not found) are returned as MCP tool errors (`isError: true`).
 
 Set `TodoApp:DataPath` (env `TodoApp__DataPath`) to override the `/data` storage directory.
 

@@ -8,6 +8,14 @@ public sealed class UserProxyOptions
     public string ProxyId { get; set; } = "user-proxy";
 
     /// <summary>
+    /// When true, this proxy's response queues are ephemeral: deleted when the proxy stops
+    /// and expired by the broker after an idle period. Set for short-lived proxies (the CLI)
+    /// whose <see cref="ProxyId"/> is unique per run; leave false for long-lived proxies with
+    /// a stable identity (Blazor). Default false.
+    /// </summary>
+    public bool EphemeralQueues { get; set; }
+
+    /// <summary>
     /// Human-friendly channel name for this proxy ("cli", "blazor", "discord", …), stamped
     /// onto outgoing <see cref="UserMessage.ChannelName"/> so unsolicited replies can show
     /// the user which client originated the work. Defaults to the portion of
@@ -27,6 +35,11 @@ public sealed class UserProxyOptions
     /// Used to scope message bus topics so multiple agent instances can share the same broker.
     /// </summary>
     public string AgentName { get; set; } = "RockBot";
+
+    /// <summary>
+    /// How long to wait for the agent's reply before giving up. Set from
+    /// <c>UserProxy:ReplyTimeout</c> by the Blazor client and <c>--timeout</c> by the CLI.
+    /// </summary>
     public TimeSpan DefaultReplyTimeout { get; set; } = TimeSpan.FromMinutes(3);
 
     /// <summary>

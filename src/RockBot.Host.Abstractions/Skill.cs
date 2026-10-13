@@ -25,6 +25,16 @@ namespace RockBot.Host;
 /// Each entry corresponds to a file that can be fetched via <c>get_skill_resource</c>.
 /// <c>null</c> or empty for skills with no sub-resources (backwards-compatible).
 /// </param>
+/// <param name="SurfaceBaseline">
+/// For <c>mcp/{server}</c> skills: the server surface the content was last written against.
+/// Set only by content writes (<c>save_skill</c>, <c>edit_skill</c>, repair tickets, the dream
+/// refresh pass); every other write carries it forward. <c>null</c> means freshness is unknown.
+/// </param>
+/// <param name="CodeOwned">
+/// <c>true</c> for a starter skill: the stored copy of a tool guide, maintained in code and
+/// re-synced from it at startup. Nothing else may change its content, summary, name or
+/// existence; resource attachments are still allowed. See <see cref="CodeOwnedSkills"/>.
+/// </param>
 public sealed record Skill(
     string Name,
     string Summary,
@@ -33,4 +43,6 @@ public sealed record Skill(
     DateTimeOffset? UpdatedAt = null,
     DateTimeOffset? LastUsedAt = null,
     IReadOnlyList<string>? SeeAlso = null,
-    IReadOnlyList<SkillResource>? Manifest = null);
+    IReadOnlyList<SkillResource>? Manifest = null,
+    SkillSurfaceBaseline? SurfaceBaseline = null,
+    bool CodeOwned = false);

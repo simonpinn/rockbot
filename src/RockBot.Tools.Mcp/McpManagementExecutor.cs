@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using RockBot.Host;
 using RockBot.Messaging;
@@ -9,7 +10,7 @@ using RockBot.Tools.Mcp.Recovery;
 namespace RockBot.Tools.Mcp;
 
 /// <summary>
-/// <see cref="IToolExecutor"/> for the 6 MCP management tools registered by
+/// <see cref="IToolExecutor"/> for the MCP management tools registered by
 /// <see cref="McpServersIndexedHandler"/>:
 /// <list type="bullet">
 ///   <item><c>mcp_list_services</c> — returns cached server index</item>
@@ -18,9 +19,12 @@ namespace RockBot.Tools.Mcp;
 ///   <item><c>mcp_register_server</c> — asks bridge to connect a new server</item>
 ///   <item><c>mcp_unregister_server</c> — asks bridge to remove a server</item>
 ///   <item><c>mcp_get_prompt</c> — invokes a prompt template on an MCP server</item>
+///   <item><c>mcp_list_resources</c> — lists a server's resources and resource templates</item>
+///   <item><c>mcp_read_resource</c> — reads one resource by the server's URI</item>
+///   <item><c>mcp_answer</c> — answers a question a server handed back mid-call (registered only while a server can)</item>
 /// </list>
 /// </summary>
-public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
+public sealed class McpManagementExecutor : IToolExecutor, IMcpQuestionAnswerer, IAsyncDisposable
 {
     private readonly McpServerIndex _index;
     private readonly McpToolProxy _proxy;
@@ -32,6 +36,8 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
     private readonly McpRecoveryExecutor? _recovery;
     private readonly ISkillStore? _skillStore;
     private readonly ToolSchemaCache? _schemaCache;
+    private readonly McpTypedToolSurface? _typedTools;
+    private readonly IMcpSkillSurface? _skillSurface;
 
     private readonly ConcurrentDictionary<string, TaskCompletionSource<MessageEnvelope>> _pending = new();
     private ISubscription? _responseSubscription;
@@ -56,7 +62,9 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
         TimeSpan? timeout = null,
         McpRecoveryExecutor? recovery = null,
         ISkillStore? skillStore = null,
-        ToolSchemaCache? schemaCache = null)
+        ToolSchemaCache? schemaCache = null,
+        McpTypedToolSurface? typedTools = null,
+        IMcpSkillSurface? skillSurface = null)
     {
         _index = index;
         _proxy = proxy;
@@ -68,6 +76,8 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
         _recovery = recovery;
         _skillStore = skillStore;
         _schemaCache = schemaCache;
+        _typedTools = typedTools;
+        _skillSurface = skillSurface;
     }
 
     public string ResponseTopic => $"mcp.manage.response.{_identity.Name}";
@@ -75,26 +85,233 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
     public Task<ToolInvokeResponse> ExecuteAsync(ToolInvokeRequest request, CancellationToken ct) =>
         request.ToolName switch
         {
-            "mcp_list_services"       => Task.FromResult(ListServices(request)),
+            "mcp_list_services"       => ListServicesAsync(request, ct),
             "mcp_get_service_details" => GetServiceDetailsAsync(request, ct),
             "mcp_invoke_tool"         => InvokeToolAsync(request, ct),
             "mcp_register_server"     => RegisterServerAsync(request, ct),
             "mcp_unregister_server"   => UnregisterServerAsync(request, ct),
             "mcp_get_prompt"          => GetPromptAsync(request, ct),
+            "mcp_list_resources"      => ListResourcesAsync(request, ct),
+            "mcp_read_resource"       => ReadResourceAsync(request, ct),
+            McpHandbackContext.AnswerToolName => AnswerAsync(request, ct),
             _ => Task.FromResult(Error(request, $"Unknown management tool: {request.ToolName}"))
         };
 
+    // ── mcp_answer ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Answers (or declines) a question an MCP server asked mid-call and the bridge handed back.
+    /// The result is the resumed call's: the tool's result, or the server's next question.
+    /// </summary>
+    private async Task<ToolInvokeResponse> AnswerAsync(ToolInvokeRequest request, CancellationToken ct)
+    {
+        string? questionId = null;
+        string? answers = null;
+        var decline = false;
+        try
+        {
+            using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(request.Arguments) ? "{}" : request.Arguments);
+            var root = document.RootElement;
+            if (root.ValueKind == JsonValueKind.Object)
+            {
+                if (root.TryGetProperty("question_id", out var id) && id.ValueKind == JsonValueKind.String)
+                    questionId = id.GetString();
+
+                // Models sometimes send the object as a JSON string; take either.
+                if (root.TryGetProperty("answers", out var a))
+                {
+                    answers = a.ValueKind switch
+                    {
+                        JsonValueKind.Object => a.GetRawText(),
+                        JsonValueKind.String => a.GetString(),
+                        _ => null,
+                    };
+                }
+
+                if (root.TryGetProperty("decline", out var d))
+                {
+                    decline = d.ValueKind == JsonValueKind.True
+                              || (d.ValueKind == JsonValueKind.String && bool.TryParse(d.GetString(), out var parsed) && parsed);
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            return Error(request, "mcp_answer arguments must be a JSON object: {\"question_id\": \"...\", \"answers\": {...}} or {\"question_id\": \"...\", \"decline\": true}.");
+        }
+
+        if (string.IsNullOrWhiteSpace(questionId))
+            return Error(request, "Missing required parameter: question_id");
+        if (!decline && string.IsNullOrWhiteSpace(answers))
+            return Error(request, "Provide answers (an object keyed by the server's field names), or decline: true.");
+
+        var envelope = await SendRequestAsync(new McpAnswerQuestionRequest
+        {
+            QuestionId = questionId,
+            SessionId = request.SessionId,
+            ToolCallId = request.ToolCallId,
+            Answers = decline ? null : answers,
+            Decline = decline,
+        }, ct, _proxy.ResponseTimeout);
+
+        if (envelope is null)
+        {
+            return Error(request,
+                "Timed out waiting for the MCP call to continue after the answer. The answer was delivered; " +
+                "don't answer the same question again.");
+        }
+
+        var response = envelope.GetPayload<McpAnswerQuestionResponse>();
+        if (response is null)
+            return Error(request, "Failed to deserialize the mcp_answer response");
+        if (response.Error is not null)
+            return Error(request, response.Error);
+        if (response.Result is not { } result)
+            return Error(request, "The bridge returned no result for the answer.");
+
+        // The result is the original call's. Recovery isn't run on it: recovery retries a call
+        // with filled-in arguments, and the original arguments aren't here; the agent can retry.
+        if (response.ServerName is { Length: > 0 } serverName)
+        {
+            _typedTools?.Pin(request.SessionId, serverName);
+            McpDiagnostics.RecordInvocation(serverName, McpInvocationPath.Answer, result.IsError);
+        }
+
+        return result with { ToolCallId = request.ToolCallId, ToolName = request.ToolName };
+    }
+
+    /// <summary>
+    /// Answers (or declines) a handed-back question with what the user gave in the chat's form.
+    /// The bridge checks it exactly as it checks <c>mcp_answer</c> (same session, the server's
+    /// schema, decisions only after a user turn, one-shot). Returns the bridge's response:
+    /// <see cref="McpAnswerQuestionResponse.Error"/> when refused, otherwise the resumed call's
+    /// outcome — its result, or the server's next question.
+    /// </summary>
+    /// <param name="sessionId">The run namespace of the conversation, <c>session/{id}</c>.</param>
+    public async Task<McpAnswerQuestionResponse> AnswerFromUserAsync(
+        string sessionId, string questionId, string? answersJson, bool decline, CancellationToken ct)
+    {
+        var envelope = await SendRequestAsync(new McpAnswerQuestionRequest
+        {
+            QuestionId = questionId,
+            SessionId = sessionId,
+            ToolCallId = $"form-{questionId}",
+            Answers = decline ? null : answersJson,
+            Decline = decline,
+            FromUser = true,
+        }, ct, _proxy.ResponseTimeout);
+
+        if (envelope is null)
+        {
+            return new McpAnswerQuestionResponse
+            {
+                QuestionId = questionId,
+                Result = new ToolInvokeResponse
+                {
+                    ToolCallId = $"form-{questionId}",
+                    ToolName = McpHandbackContext.AnswerToolName,
+                    Content = "The user's answer was delivered, but the MCP call didn't finish in time to report its result.",
+                    IsError = true,
+                },
+            };
+        }
+
+        var response = envelope.GetPayload<McpAnswerQuestionResponse>()
+                       ?? new McpAnswerQuestionResponse { QuestionId = questionId, Error = "The bridge's reply could not be read." };
+
+        if (response.Error is null && response.Result is { } result && response.ServerName is { Length: > 0 } serverName)
+        {
+            _typedTools?.Pin(sessionId, serverName);
+            McpDiagnostics.RecordInvocation(serverName, McpInvocationPath.Answer, result.IsError);
+        }
+
+        return response;
+    }
+
     // ── mcp_list_services ────────────────────────────────────────────────────
 
-    private ToolInvokeResponse ListServices(ToolInvokeRequest request)
+    private async Task<ToolInvokeResponse> ListServicesAsync(ToolInvokeRequest request, CancellationToken ct)
     {
-        var json = JsonSerializer.Serialize(_index.Servers, JsonOptions);
+        var renamed = await FindRenamedServerSkillsAsync(ct);
+
+        // Fingerprints are bookkeeping for the gateway, not information for the model.
+        var view = _index.Snapshot().Select(s => new ServiceView(
+            s.ServerName,
+            s.ServerId,
+            s.Summary,
+            s.ToolCount,
+            s.ToolNames,
+            s.PromptCount,
+            s.PromptNames,
+            s.ResourceCount > 0 ? s.ResourceCount : null,
+            s.ResourceCount > 0 ? s.ResourceNames : null,
+            renamed.TryGetValue(s.ServerName, out var skills) ? skills : null));
+        var json = JsonSerializer.Serialize(view, JsonOptions);
         return new ToolInvokeResponse
         {
             ToolCallId = request.ToolCallId,
             ToolName = request.ToolName,
             Content = json
         };
+    }
+
+    /// <summary>
+    /// <c>mcp_list_services</c> row. <see cref="SkillsWrittenUnderPreviousName"/> lists
+    /// <c>mcp/{old}</c> skills whose server now runs under this name (#615), so they don't go
+    /// unused without anyone noticing; omitted when there are none. The resource fields (#617)
+    /// are likewise omitted for a server without resources.
+    /// </summary>
+    private sealed record ServiceView(
+        string ServerName,
+        string? ServerId,
+        string? Summary,
+        int ToolCount,
+        List<string> ToolNames,
+        int PromptCount,
+        List<string> PromptNames,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        int? ResourceCount,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        List<string>? ResourceNames,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        IReadOnlyList<RenamedSkillView>? SkillsWrittenUnderPreviousName);
+
+    private sealed record RenamedSkillView(string Skill, string PreviousServerName);
+
+    /// <summary>
+    /// <c>mcp/{server}</c> skills whose server is gone under that name but live under another,
+    /// keyed by the current name. Empty without a skill store or skill surface.
+    /// </summary>
+    private async Task<Dictionary<string, IReadOnlyList<RenamedSkillView>>> FindRenamedServerSkillsAsync(CancellationToken ct)
+    {
+        var result = new Dictionary<string, IReadOnlyList<RenamedSkillView>>(StringComparer.OrdinalIgnoreCase);
+        if (_skillStore is null || _skillSurface is null)
+            return result;
+
+        IReadOnlyList<Skill> skills;
+        try
+        {
+            skills = await _skillStore.ListAsync();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "mcp_list_services: listing skills for rename detection failed");
+            return result;
+        }
+
+        foreach (var group in skills
+                     .Where(s => s.SurfaceBaseline is not null && McpSkillNames.TryGetServerName(s.Name, out _))
+                     .Select(s => (Skill: s, Freshness: _skillSurface.Evaluate(s)))
+                     .Where(x => x.Freshness is { Status: SkillFreshnessStatus.Renamed, RenamedTo: not null })
+                     .GroupBy(x => x.Freshness.RenamedTo!, StringComparer.OrdinalIgnoreCase))
+        {
+            result[group.Key] = group
+                .OrderBy(x => x.Skill.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(x => new RenamedSkillView(x.Skill.Name, x.Skill.SurfaceBaseline!.ServerName))
+                .ToList();
+        }
+        return result;
     }
 
     // ── mcp_get_service_details ──────────────────────────────────────────────
@@ -114,11 +331,15 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
         var tools = (IReadOnlyList<McpToolDefinition>)details.Tools;
         if (TryGetString(args, "tool_name", out var toolName))
         {
+            var allTools = tools;
             tools = tools
                 .Where(t => t.Name.Equals(toolName, StringComparison.OrdinalIgnoreCase))
                 .ToList();
             if (tools.Count == 0)
-                return Error(request, $"No tool named '{toolName}' found on server '{serverName}'");
+            {
+                return Error(request, McpCallDiagnostics.DescribeUnknownTool(
+                    serverName, toolName, allTools.Select(t => t.Name).ToList()));
+            }
         }
 
         // Surface the server's self-reported identity alongside tool schemas so the
@@ -132,17 +353,42 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
             server = new
             {
                 name = serverName,
+                id = details.ServerId,
                 implementationName = details.ImplementationName,
                 title = details.Title,
                 version = details.Version,
                 description = details.Description,
-                instructions = details.Instructions
+                instructions = McpInstructionsCap.Apply(details.Instructions, McpInstructionsCap.DetailsMaxChars,
+                    GuideToolsFor(serverName, details.Tools))
             },
             tools,
-            prompts = details.Prompts
+            prompts = PromptViews(serverName, details.Prompts)
         };
 
         var content = JsonSerializer.Serialize(payload, JsonOptions);
+
+        // Resources aren't tools, so they aren't in the payload; only a server that has some
+        // says so (#617), keeping every other details result as it was.
+        if (details.ResourceCount > 0)
+        {
+            content += $"\n\nThis server also lists {details.ResourceCount} resource(s) and resource template(s): " +
+                       $"readable data rather than tools. List them with mcp_list_resources(server_name: \"{serverName}\") " +
+                       "and read one with mcp_read_resource.";
+        }
+
+        // Lazy typed tools (#612): looking at a server's tools (or one of them) activates them
+        // for this session, so the next call can use the typed name. Only a run that activates
+        // typed tools is told so (#613).
+        if (_typedTools is not null)
+        {
+            var activated = _typedTools.Activate(request.SessionId,
+                tools.Count == 1 ? _typedTools.WrappersFor(serverName, tools[0].Name) : _typedTools.WrappersFor(serverName));
+            if (activated.Count > 0 && TypedToolSurfaceContext.IsActivating)
+            {
+                content += $"\n\nNow callable in this conversation by typed name: {string.Join(", ", activated)}. " +
+                           "Call them directly rather than through mcp_invoke_tool.";
+            }
+        }
 
         // Pre-flight skill injection: the LLM has just narrowed in on a single
         // server, so this is the moment any `mcp/{server}` skills become uniquely
@@ -151,7 +397,7 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
         // before the first mcp_invoke_tool attempt. No-op when no skill exists.
         try
         {
-            var skillBlock = await McpServerSkillFormatter.FormatAsync(_skillStore, serverName, ct);
+            var skillBlock = await McpServerSkillFormatter.FormatAsync(_skillStore, serverName, ct, _skillSurface);
             if (!string.IsNullOrEmpty(skillBlock))
                 content = content + "\n" + skillBlock;
         }
@@ -171,6 +417,44 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
     }
 
     /// <summary>
+    /// The server's prompts as details lists them. In a run that activates typed tools, each prompt
+    /// with a typed tool carries its <c>typedName</c> (#616): calling that name activates it. Listing
+    /// a prompt here never activates it.
+    /// </summary>
+    private List<PromptView> PromptViews(string serverName, List<McpPromptDefinition> prompts)
+    {
+        var typed = _typedTools is not null && TypedToolSurfaceContext.IsActivating;
+        return prompts
+            .Select(p => new PromptView(
+                p.Name,
+                p.Description,
+                p.Arguments,
+                typed ? _typedTools!.PromptWrapperFor(serverName, p.Name)?.Name : null))
+            .ToList();
+    }
+
+    private sealed record PromptView(
+        string Name,
+        string? Description,
+        List<McpPromptArgument> Arguments,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        string? TypedName);
+
+    /// <summary>
+    /// The server's guide-like tools (<see cref="McpInstructionsCap.GuideTools"/>), named the way
+    /// this run calls them: by typed name when it has typed tools, else through mcp_invoke_tool.
+    /// </summary>
+    private List<string> GuideToolsFor(string serverName, IEnumerable<McpToolDefinition> tools)
+    {
+        var typed = TypedToolSurfaceContext.Mode is TypedToolMode.Eager or TypedToolMode.Lazy or TypedToolMode.Pinned;
+        return McpInstructionsCap.GuideTools(tools.Select(t => t.Name))
+            .Select(name => typed && _typedTools?.WrappersFor(serverName, name).FirstOrDefault() is { } wrapper
+                ? $"`{wrapper.Name}`"
+                : $"`{name}` (through mcp_invoke_tool)")
+            .ToList();
+    }
+
+    /// <summary>
     /// Internal entry point used by the recovery layer's <see cref="ToolSchemaCache"/>:
     /// fetches the full tool list for one MCP server via the bridge without going
     /// through the LLM-facing <c>mcp_get_service_details</c> tool. Returns null
@@ -182,6 +466,17 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
         var response = await GetServiceDetailsAsync(serverName, ct);
         if (response is null || response.Error is not null) return null;
         return response.Tools;
+    }
+
+    /// <summary>
+    /// <see cref="GetSchemasAsync"/> plus the server's prompt definitions, from the same details
+    /// round trip (#616). Returns null on timeout or transport failure.
+    /// </summary>
+    public async Task<McpServerSurface?> GetSurfaceAsync(string serverName, CancellationToken ct)
+    {
+        var response = await GetServiceDetailsAsync(serverName, ct);
+        if (response is null || response.Error is not null) return null;
+        return new McpServerSurface(response.Tools, response.Prompts);
     }
 
     /// <summary>
@@ -253,18 +548,40 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
                 return Error(request, remediation);
         }
 
+        return await InvokeDownstreamAsync(serverName, toolName, toolArgs, request, McpInvocationPath.InvokeTool, ct);
+    }
+
+    /// <summary>
+    /// The one path every downstream MCP tool call takes, whether the model used
+    /// <c>mcp_invoke_tool</c> or a typed <c>{server}__{tool}</c> wrapper: the bridge (guards,
+    /// attachments, elicitation, timeouts, reconnect-and-retry, error hints) and then recovery.
+    /// <paramref name="via"/> tags logs and metrics so reliability can be compared by surface.
+    /// </summary>
+    internal async Task<ToolInvokeResponse> InvokeDownstreamAsync(
+        string serverName,
+        string toolName,
+        string? toolArgs,
+        ToolInvokeRequest outer,
+        string via,
+        CancellationToken ct)
+    {
         var innerRequest = new ToolInvokeRequest
         {
-            ToolCallId = request.ToolCallId,
+            ToolCallId = outer.ToolCallId,
             ToolName = toolName,
             Arguments = toolArgs,
-            SessionId = request.SessionId
+            SessionId = outer.SessionId
         };
 
         var extraHeaders = new Dictionary<string, string>
         {
             [McpHeaders.ServerName] = serverName
         };
+
+        // A server in hand-back mode may hand its mid-call question to this run, but only to a
+        // run that can answer it with mcp_answer.
+        if (McpHandbackContext.CanAnswer)
+            extraHeaders[McpHeaders.Handback] = McpHeaders.HandbackCapable;
 
         var response = await _proxy.ExecuteAsync(innerRequest, extraHeaders, ct);
 
@@ -277,8 +594,17 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
         if (_recovery is not null)
         {
             response = await _recovery.RecoverAsync(
-                serverName, toolName, innerRequest, response, ct, sessionId: request.SessionId);
+                serverName, toolName, innerRequest, response, ct, sessionId: outer.SessionId);
         }
+
+        // Pinned typed tools (#613): a server this session calls keeps all its typed tools in
+        // the session's list. Either path counts; a failed call does too, since the typed tool's
+        // schema is the likeliest way to get the next one right.
+        _typedTools?.Pin(outer.SessionId, serverName);
+
+        McpDiagnostics.RecordInvocation(serverName, via, response.IsError);
+        _logger.LogDebug("MCP {Server}/{Tool} via {Via}: {Outcome}",
+            serverName, toolName, via, response.IsError ? "error" : "ok");
 
         return response;
     }
@@ -369,22 +695,52 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
         if (TryGetNestedArgs(args, out var argsObj))
         {
             var argsJson = argsObj is JsonElement je ? je.GetRawText() : JsonSerializer.Serialize(argsObj, JsonOptions);
-            try
-            {
-                var parsed = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(argsJson, JsonOptions);
-                if (parsed is not null)
-                {
-                    foreach (var (k, v) in parsed)
-                    {
-                        promptArgs[k] = v.ValueKind == JsonValueKind.String
-                            ? v.GetString() ?? string.Empty
-                            : v.GetRawText();
-                    }
-                }
-            }
-            catch { /* ignore malformed arguments */ }
+            promptArgs = ToPromptArguments(argsJson);
         }
 
+        return await GetPromptDownstreamAsync(serverName, promptName, promptArgs, request, McpInvocationPath.GetPrompt, ct);
+    }
+
+    /// <summary>
+    /// Prompt arguments as the bridge takes them: every value a string. A JSON string is passed
+    /// as-is, anything else as its raw JSON text. Malformed JSON yields no arguments.
+    /// </summary>
+    internal static Dictionary<string, string> ToPromptArguments(string? argsJson)
+    {
+        var promptArgs = new Dictionary<string, string>();
+        if (string.IsNullOrWhiteSpace(argsJson))
+            return promptArgs;
+        try
+        {
+            var parsed = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(argsJson, JsonOptions);
+            if (parsed is not null)
+            {
+                foreach (var (k, v) in parsed)
+                {
+                    promptArgs[k] = v.ValueKind == JsonValueKind.String
+                        ? v.GetString() ?? string.Empty
+                        : v.GetRawText();
+                }
+            }
+        }
+        catch { /* ignore malformed arguments */ }
+        return promptArgs;
+    }
+
+    /// <summary>
+    /// The one path every downstream MCP prompt takes, whether the model used <c>mcp_get_prompt</c>
+    /// or a typed <c>{server}__{prompt}-prompt</c> tool (#616): the bridge's <c>prompts/get</c>
+    /// (pre-check, timeout, reconnect-and-retry), then the filled-in messages as JSON.
+    /// <paramref name="via"/> tags logs and metrics, as <see cref="InvokeDownstreamAsync"/> does.
+    /// </summary>
+    internal async Task<ToolInvokeResponse> GetPromptDownstreamAsync(
+        string serverName,
+        string promptName,
+        Dictionary<string, string> promptArgs,
+        ToolInvokeRequest outer,
+        string via,
+        CancellationToken ct)
+    {
         var mgmtRequest = new McpGetPromptRequest
         {
             ServerName = serverName,
@@ -393,27 +749,115 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
         };
 
         var responseEnvelope = await SendRequestAsync(mgmtRequest, ct);
-        if (responseEnvelope is null)
-            return Error(request, $"Timed out waiting for prompt '{promptName}' from server '{serverName}'");
+        var response = responseEnvelope?.GetPayload<McpGetPromptResponse>();
+        var result = responseEnvelope is null
+            ? Error(outer, $"Timed out waiting for prompt '{promptName}' from server '{serverName}'")
+            : response is null
+                ? Error(outer, "Failed to deserialize prompt response")
+                : response.Error is not null
+                    ? Error(outer, response.Error)
+                    : new ToolInvokeResponse
+                    {
+                        ToolCallId = outer.ToolCallId,
+                        ToolName = outer.ToolName,
+                        Content = JsonSerializer.Serialize(response.Messages, JsonOptions)
+                    };
 
-        var response = responseEnvelope.GetPayload<McpGetPromptResponse>();
+        McpDiagnostics.RecordPromptInvocation(serverName, via, result.IsError);
+        _logger.LogDebug("MCP prompt {Server}/{Prompt} via {Via}: {Outcome}",
+            serverName, promptName, via, result.IsError ? "error" : "ok");
+
+        return result;
+    }
+
+    // ── mcp_list_resources / mcp_read_resource (#617) ────────────────────────
+
+    private async Task<ToolInvokeResponse> ListResourcesAsync(ToolInvokeRequest request, CancellationToken ct)
+    {
+        var args = ParseArguments(request.Arguments);
+        if (!TryGetServerName(args, out var serverName))
+            return Error(request, "Missing required parameter: server_name");
+
+        var responseEnvelope = await SendRequestAsync(new McpListResourcesRequest { ServerName = serverName }, ct);
+        if (responseEnvelope is null)
+            return Error(request, $"Timed out waiting for the resource list of '{serverName}'");
+        var response = responseEnvelope.GetPayload<McpListResourcesResponse>();
         if (response is null)
-            return Error(request, "Failed to deserialize prompt response");
+            return Error(request, "Failed to deserialize resource list response");
         if (response.Error is not null)
             return Error(request, response.Error);
+
+        var content = response.Resources.Count + response.Templates.Count == 0
+            ? $"MCP server '{serverName}' lists no resources or resource templates."
+            : JsonSerializer.Serialize(new
+            {
+                server = serverName,
+                resources = response.Resources.Select(ResourceView),
+                templates = response.Templates.Select(ResourceView)
+            }, ResourceJsonOptions);
 
         return new ToolInvokeResponse
         {
             ToolCallId = request.ToolCallId,
             ToolName = request.ToolName,
-            Content = JsonSerializer.Serialize(response.Messages, JsonOptions)
+            Content = content
+        };
+
+        static object ResourceView(McpResourceDefinition r) => new
+        {
+            uri = r.IsTemplate ? null : r.Uri,
+            uriTemplate = r.IsTemplate ? r.Uri : null,
+            name = r.Name,
+            title = r.Title,
+            description = r.Description,
+            mimeType = r.MimeType,
+            size = r.Size
         };
     }
 
+    private async Task<ToolInvokeResponse> ReadResourceAsync(ToolInvokeRequest request, CancellationToken ct)
+    {
+        var args = ParseArguments(request.Arguments);
+        if (!TryGetServerName(args, out var serverName))
+            return Error(request, "Missing required parameter: server_name");
+        if (!TryGetString(args, "uri", out var uri))
+            return Error(request, "Missing required parameter: uri");
+
+        var responseEnvelope = await SendRequestAsync(new McpReadResourceRequest { ServerName = serverName, Uri = uri }, ct);
+        var response = responseEnvelope?.GetPayload<McpReadResourceResponse>();
+        var result = responseEnvelope is null
+            ? Error(request, $"Timed out waiting for resource '{uri}' from server '{serverName}'")
+            : response is null
+                ? Error(request, "Failed to deserialize resource read response")
+                : response.Error is not null
+                    ? Error(request, response.Error)
+                    : new ToolInvokeResponse
+                    {
+                        ToolCallId = request.ToolCallId,
+                        ToolName = request.ToolName,
+                        Content = JsonSerializer.Serialize(
+                            new { server = serverName, uri, contents = response.Contents }, ResourceJsonOptions)
+                    };
+
+        McpDiagnostics.RecordResourceRead(serverName, result.IsError);
+        _logger.LogDebug("MCP resource read {Server} {Uri}: {Outcome}", serverName, uri, result.IsError ? "error" : "ok");
+        return result;
+    }
+
+    /// <summary>
+    /// Resource views leave out absent fields: a text item has no path, a saved file no text, and
+    /// most resources have no title or size.
+    /// </summary>
+    private static readonly JsonSerializerOptions ResourceJsonOptions = new(JsonOptions)
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
     // ── Request-response infrastructure ─────────────────────────────────────
 
-    private async Task<MessageEnvelope?> SendRequestAsync<T>(T payload, CancellationToken ct)
+    private async Task<MessageEnvelope?> SendRequestAsync<T>(T payload, CancellationToken ct, TimeSpan? timeout = null)
     {
+        var wait = timeout ?? _timeout;
         await EnsureSubscribedAsync(ct);
 
         var correlationId = Guid.NewGuid().ToString("N");
@@ -430,7 +874,7 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
             await _publisher.PublishAsync(ManageTopic, envelope, ct);
 
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeoutCts.CancelAfter(_timeout);
+            timeoutCts.CancelAfter(wait);
 
             try
             {
@@ -438,7 +882,7 @@ public sealed class McpManagementExecutor : IToolExecutor, IAsyncDisposable
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
-                _logger.LogWarning("Management request timed out after {TimeoutMs}ms", _timeout.TotalMilliseconds);
+                _logger.LogWarning("Management request timed out after {TimeoutMs}ms", wait.TotalMilliseconds);
                 return null;
             }
         }

@@ -18,6 +18,8 @@
     <PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.*" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.*" />
     <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.*" />
+    <!-- In-process MCP fixture server for the bridge's end-to-end tests. -->
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -32,6 +34,8 @@
     <!-- Inbound-attachment bus proof: drives the real client call over a real broker. -->
     <ProjectReference Include="..\..\src\RockBot.Messaging.RabbitMQ\RockBot.Messaging.RabbitMQ.csproj" />
     <ProjectReference Include="..\..\src\RockBot.UserProxy\RockBot.UserProxy.csproj" />
+    <!-- Aliased: its McpServer.* namespace would otherwise shadow the SDK's McpServer type. -->
+    <ProjectReference Include="..\..\src\McpServer.ElicitationFixture\McpServer.ElicitationFixture.csproj" Aliases="fixture" />
   </ItemGroup>
 
 </Project>

@@ -16,7 +16,8 @@ namespace RockBot.Tools.Mcp;
 public static class McpServiceCollectionExtensions
 {
     /// <summary>
-    /// Registers MCP tool servers for in-process execution (used by the MCP Bridge process).
+    /// Registers stdio MCP tool servers for direct in-process execution, without the bridge.
+    /// Not the production path: the agent uses <see cref="AddMcpToolProxy"/> with the hosted bridge.
     /// </summary>
     public static AgentHostBuilder AddMcpTools(
         this AgentHostBuilder builder,
@@ -34,8 +35,11 @@ public static class McpServiceCollectionExtensions
     /// <summary>
     /// Registers the MCP management proxy for agents that interact with MCP servers via
     /// the message bus. On startup the bridge sends <see cref="McpServersIndexed"/>;
-    /// the handler registers exactly 5 management tools in <see cref="IToolRegistry"/>
-    /// instead of one tool per schema.
+    /// the handler registers the 8 management tools in <see cref="IToolRegistry"/>,
+    /// plus a typed <c>{server}__{tool}</c> tool per downstream tool when some tier's wrapper mode
+    /// (<see cref="McpToolSurfaceOptions.ModeFor"/>) is <see cref="McpWrapperMode.Eager"/>, or
+    /// <c>mcp_find_tools</c> and per-session activation when one is <see cref="McpWrapperMode.Lazy"/>
+    /// or <see cref="McpWrapperMode.Pinned"/>.
     /// </summary>
     public static AgentHostBuilder AddMcpToolProxy(
         this AgentHostBuilder builder,
@@ -57,6 +61,8 @@ public static class McpServiceCollectionExtensions
 
         builder.Services.AddSingleton<McpServerIndex>();
         builder.Services.AddSingleton<McpManagementExecutor>();
+        builder.Services.AddSingleton<IMcpQuestionAnswerer>(sp => sp.GetRequiredService<McpManagementExecutor>());
+        builder.Services.AddSingleton<ISessionEndListener, McpHandbackSessionEndListener>();
         builder.Services.AddHostedService<McpStartupProbeService>();
         builder.Services.AddHostedService<McpSkillNameMigrationService>();
         builder.Services.AddSingleton<IToolSkillProvider, McpToolSkillProvider>();
@@ -76,12 +82,19 @@ public static class McpServiceCollectionExtensions
         builder.Services.TryAddEnumerable(ServiceDescriptor.Singleton<IToolArgumentDefaultsProvider, FileToolDefaultsProvider>());
 
         // Self-repair Amendment 1: schema-error enrichment. The cache populates lazily
-        // through McpManagementExecutor.GetSchemasAsync — the Func factory defers DI
+        // through McpManagementExecutor.GetSurfaceAsync — the Func factory defers DI
         // resolution to call time so the executor → recovery → enricher → cache cycle
-        // resolves without DI complaining.
-        builder.Services.AddSingleton(sp => new ToolSchemaCache(
-            (server, ct) => sp.GetRequiredService<McpManagementExecutor>().GetSchemasAsync(server, ct)));
+        // resolves without DI complaining. It keeps each server's prompts too, for the typed
+        // prompt tools (#616).
+        builder.Services.AddSingleton(sp => ToolSchemaCache.WithPrompts(
+            (server, ct) => sp.GetRequiredService<McpManagementExecutor>().GetSurfaceAsync(server, ct)));
         builder.Services.AddSingleton<SchemaErrorEnricher>();
+
+        // Skill freshness (#615): baselines for mcp/{server} skills and the stale marker. The
+        // interface lives in Host.Abstractions so skill tools, repair tickets and the dream service
+        // can use it without referencing this project.
+        builder.Services.AddSingleton<IMcpSkillSurface>(sp => new McpSkillSurface(
+            sp.GetRequiredService<McpServerIndex>(), sp.GetRequiredService<ToolSchemaCache>()));
 
         builder.Services.AddSingleton<McpRecoveryExecutor>();
 
@@ -90,6 +103,19 @@ public static class McpServiceCollectionExtensions
         // errors before invoking the tool, without RockBot.Wisp taking a hard dependency
         // on RockBot.Tools.Mcp.
         builder.Services.AddSingleton<IMcpPreflightRecovery, McpPreflightRecovery>();
+
+        // Typed {server}__{tool} tools (#420), eager or lazy (#612). Off unless McpBridge:WrapperMode
+        // says otherwise. The surface is what the agent loop sees: it carries each session's lazy
+        // activations into the run's tool list.
+        builder.Services.AddOptions<McpToolSurfaceOptions>();
+        builder.Services.AddSingleton<McpTypedToolSurface>();
+        builder.Services.AddSingleton<ITypedToolSurface>(sp => sp.GetRequiredService<McpTypedToolSurface>());
+        builder.Services.AddSingleton<McpWrapperCatalog>();
+
+        // Typed tools by server and tool, or by typed name, for code that can't see the catalog —
+        // wisps above all (#647): in pinned and lazy modes no wrapper is in the registry.
+        builder.Services.AddSingleton<IMcpToolDirectory>(sp => new McpToolDirectory(
+            sp.GetRequiredService<McpWrapperCatalog>(), sp.GetRequiredService<McpServerIndex>()));
 
         builder.HandleMessage<McpServersIndexed, McpServersIndexedHandler>();
         builder.SubscribeTo($"tool.meta.mcp.{agentName}");

@@ -1,14 +1,23 @@
+using RockBot.Messaging;
+
 namespace RockBot.Host;
 
 /// <summary>
-/// A topic subscription paired with its dispatch concurrency.
+/// A topic subscription paired with its dispatch concurrency and, optionally, the
+/// per-subscription queue options (retention, dead-lettering) it is subscribed with.
 /// </summary>
 /// <param name="Topic">The topic pattern (with wildcards).</param>
 /// <param name="DispatchConcurrency">Maximum concurrent in-flight handler invocations
 /// for this subscription. Default 1 (sequential, preserves ordering). Bump only for
 /// re-entrant handlers where cross-message coordination would otherwise deadlock the
 /// consumer (e.g. the subagent-result consolidation gate).</param>
-public sealed record TopicSubscription(string Topic, int DispatchConcurrency = 1);
+/// <param name="Options">Queue options for this subscription, such as retention for a
+/// shared fan-out topic. Null subscribes with the defaults. <see cref="DispatchConcurrency"/>
+/// always wins over <see cref="SubscriptionOptions.DispatchConcurrency"/>.</param>
+public sealed record TopicSubscription(
+    string Topic,
+    int DispatchConcurrency = 1,
+    SubscriptionOptions? Options = null);
 
 /// <summary>
 /// Which shape of image pricing a provider uses. These are genuinely different models, not
@@ -243,6 +252,38 @@ public sealed class AgentHostOptions
     public int MaxLlmContextTurns { get; set; } = 20;
 
     /// <summary>
+    /// How many of the most recent history turns are replayed in full (#670). Older turns inside
+    /// the <see cref="MaxLlmContextTurns"/> window keep only their start and end, up to
+    /// <see cref="HistoryOlderTurnMaxChars"/>. Conversation memory always keeps the full text.
+    /// Default 6.
+    /// </summary>
+    public int HistoryFullTurns { get; set; } = 6;
+
+    /// <summary>
+    /// Character budget for a history turn older than the last <see cref="HistoryFullTurns"/>
+    /// (#670). Set to 0 to replay every turn in full. Default 2,000.
+    /// </summary>
+    public int HistoryOlderTurnMaxChars { get; set; } = 2_000;
+
+    /// <summary>
+    /// Character budget for a subagent result in history once the primary has relayed it to the
+    /// user (#670). The relay turn holds the subagent's whole report — 15K chars has been seen —
+    /// and the synthesized reply that follows repeats what mattered. The full report is kept in
+    /// working memory (<c>subagent/{taskId}/output</c>, 24 hours) when it is longer than this.
+    /// Set to 0 to replay relays in full. Default 1,200.
+    /// </summary>
+    public int RelayedSubagentTurnMaxChars { get; set; } = 1_200;
+
+    /// <summary>
+    /// When true (the default), interactive turns leave rarely used tool families — A2A, scheduling,
+    /// wisps, workers, skill authoring, memory administration, MCP server administration — out of
+    /// the tool list until the conversation loads them with <c>get_tool_guide</c> or calls one of
+    /// their tools by name (#670; see <see cref="DeferredToolFamilies"/>). Set false
+    /// (<c>AgentHost__DeferRareToolFamilies=false</c>) to send every tool on every request.
+    /// </summary>
+    public bool DeferRareToolFamilies { get; set; } = true;
+
+    /// <summary>
     /// Maximum number of times the completion evaluator can re-prompt the agent when it
     /// determines the task is incomplete. Set to 0 to disable completion evaluation entirely.
     /// Individual models may override this via <c>ModelBehavior.MaxCompletionRepromptsOverride</c>.
@@ -310,6 +351,9 @@ public sealed class AgentHostOptions
     /// bloats a subagent run without crossing the global watermark.
     /// Default 8,000 chars (≈2,000 tokens). Set to 0 to disable per-call capping and
     /// rely solely on the watermark.
+    /// Explicit working-memory retrievals (<see cref="StashExemptTools"/>) and tools that
+    /// page their own output (<see cref="SelfPagingTools"/>, i.e. <c>file_read</c>, which has
+    /// its own <c>FileSystem:FileReadMaxChars</c> budget) are not capped.
     /// </summary>
     public int ToolResultMaxChars { get; set; } = 8_000;
 
@@ -332,4 +376,12 @@ public sealed class AgentHostOptions
     /// Default 5. Set to 0 to disable aging and leave all skill bodies in context.
     /// </summary>
     public int SkillBodyUnloadAfterIterations { get; set; } = 5;
+
+    /// <summary>
+    /// The consequential-action gate (#685): in a run whose originating user message asked for
+    /// nothing, tool calls that would change an external system (MCP writes, the agent's scheduled
+    /// tasks) are refused and the model is told to propose them instead. Configure under
+    /// <c>AgentHost:ConsequentialActionGate</c> (env: <c>AgentHost__ConsequentialActionGate__Enabled</c>).
+    /// </summary>
+    public ConsequentialActionGateOptions ConsequentialActionGate { get; } = new();
 }

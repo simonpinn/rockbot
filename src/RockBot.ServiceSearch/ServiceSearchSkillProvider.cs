@@ -35,12 +35,14 @@ public sealed class ServiceSearchSkillProvider : IToolSkillProvider
         - summary: LLM-generated description of the service's purpose
         - relevance_score: [0, 1] — 1.0 means top match; below ~0.3 consider keeping searching
         - top_skills: (A2A only) 2–3 skill IDs available on the agent
-        - top_tools: (MCP only) 2–3 tool names available on the server
+        - top_tools: (MCP only) 2–3 tool names available on the server. When typed MCP tools
+          are on, these are typed names ({server}__{tool}) picked for your query.
 
         ## Deciding what to do with a result
 
         If type == "mcp":
-          → Use mcp_invoke_tool with the id as server_name (synchronous, returns immediately)
+          → If top_tools are typed names, call the one you need directly
+          → Otherwise use mcp_invoke_tool with the id as server_name (synchronous, returns immediately)
           → For tool details first: mcp_get_service_details(server_name=id)
 
         If type == "a2a":
@@ -64,7 +66,8 @@ public sealed class ServiceSearchSkillProvider : IToolSkillProvider
         as a hint in the context (labeled "Potentially relevant services"). These are the
         same BM25 results you would get from calling search_known_services. If the hint
         already identifies the right service with a high relevance_score, you can skip the
-        explicit tool call and proceed directly to mcp_invoke_tool or invoke_agent.
+        explicit tool call and go straight to the service: its typed tool (or mcp_invoke_tool)
+        for MCP, invoke_agent for an agent.
 
         ## Typical routing workflow
         1. Check context hint — if a service is already surfaced with high relevance, use it
@@ -72,6 +75,7 @@ public sealed class ServiceSearchSkillProvider : IToolSkillProvider
         3. Read the top result: check type, summary, and top_skills/top_tools
         4. If relevance_score < 0.3 or summary doesn't match, call mcp_list_services +
            list_known_agents to browse manually
-        5. Once identified: invoke with mcp_invoke_tool (mcp) or invoke_agent (a2a)
+        5. Once identified: call the typed tool, or mcp_invoke_tool when there is none (mcp), or
+           invoke_agent (a2a). Before a server's first use, read its mcp/{server} skill.
         """;
 }

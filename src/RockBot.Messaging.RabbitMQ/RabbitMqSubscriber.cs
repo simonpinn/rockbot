@@ -29,12 +29,25 @@ public sealed class RabbitMqSubscriber : IMessageSubscriber
         _logger = logger;
     }
 
-    public async Task<ISubscription> SubscribeAsync(
+    public Task<ISubscription> SubscribeAsync(
         string topic,
         string subscriptionName,
         Func<MessageEnvelope, CancellationToken, Task<MessageResult>> handler,
         CancellationToken cancellationToken = default,
         int dispatchConcurrency = 1)
+        => SubscribeAsync(
+            topic,
+            subscriptionName,
+            handler,
+            new SubscriptionOptions { DispatchConcurrency = dispatchConcurrency },
+            cancellationToken);
+
+    public async Task<ISubscription> SubscribeAsync(
+        string topic,
+        string subscriptionName,
+        Func<MessageEnvelope, CancellationToken, Task<MessageResult>> handler,
+        SubscriptionOptions options,
+        CancellationToken cancellationToken = default)
     {
         var queueName = $"rockbot.{subscriptionName}";
         var dlqName = $"{queueName}.dlq";
@@ -42,31 +55,76 @@ public sealed class RabbitMqSubscriber : IMessageSubscriber
         var dlxName = _options.DeadLetterExchangeName;
         var prefetchCount = _options.PrefetchCount;
         var durable = _options.Durable;
+        var ephemeral = options.Ephemeral;
+        var deadLetter = options.DeadLetter;
+        var dlqArgs = BuildDlqArguments(_options, options);
+        var args = BuildQueueArguments(_options, topic, options);
         // Translate the abstraction's dispatchConcurrency hint into a channel-level
         // ConsumerDispatchConcurrency. Values <=1 leave it unset so we keep the
         // connection-level default and the channel processes deliveries sequentially.
-        var channelConcurrency = dispatchConcurrency > 1 ? (ushort?)dispatchConcurrency : null;
+        var channelConcurrency = options.DispatchConcurrency > 1 ? (ushort?)options.DispatchConcurrency : null;
 
-        // Factory that creates a fresh channel + consumer, called both for initial
-        // setup and for transparent reconnection after unexpected channel closure.
-        async Task<(IChannel channel, string consumerTag)> CreateChannelAndConsumerAsync(
-            CancellationToken ct)
+        async Task<IChannel> OpenChannelAsync(CancellationToken ct)
         {
             var channel = await _connectionManager.CreateChannelAsync(ct, channelConcurrency);
-
             await channel.BasicQosAsync(
                 prefetchSize: 0,
                 prefetchCount: prefetchCount,
                 global: false,
                 cancellationToken: ct);
+            return channel;
+        }
 
-            // Declare dead-letter queue
-            await channel.QueueDeclareAsync(
-                queue: dlqName,
-                durable: durable,
-                exclusive: false,
-                autoDelete: false,
-                cancellationToken: ct);
+        // Declares and binds the dead-letter queue, returning the channel to keep using
+        // (a 406 kills the channel it happened on, so a fresh one may be returned).
+        // A DLQ declared before retention caps existed (or with different caps) fails
+        // with 406 PRECONDITION_FAILED. An empty one is deleted and re-declared with the
+        // configured arguments; a non-empty one is kept as-is so no dead-letters are lost,
+        // and the mismatch is logged as an error on every start until it is drained.
+        async Task<IChannel> DeclareDlqAsync(IChannel channel, CancellationToken ct)
+        {
+            try
+            {
+                await channel.QueueDeclareAsync(
+                    queue: dlqName,
+                    durable: durable,
+                    exclusive: false,
+                    autoDelete: false,
+                    arguments: dlqArgs,
+                    cancellationToken: ct);
+            }
+            catch (global::RabbitMQ.Client.Exceptions.OperationInterruptedException ex)
+                when (ex.ShutdownReason?.ReplyCode == 406)
+            {
+                channel = await OpenChannelAsync(ct);
+                try
+                {
+                    await channel.QueueDeleteAsync(dlqName, ifUnused: false, ifEmpty: true, cancellationToken: ct);
+                }
+                catch (global::RabbitMQ.Client.Exceptions.OperationInterruptedException notEmpty)
+                    when (notEmpty.ShutdownReason?.ReplyCode == 406)
+                {
+                    _logger.LogError(
+                        "Dead-letter queue {Queue} was declared with arguments that differ from the configured " +
+                        "retention ({Reason}) and is not empty, so it was left as-is and is NOT capped. " +
+                        "Inspect and purge it, then restart this process to apply retention.",
+                        dlqName, ex.ShutdownReason.ReplyText);
+
+                    channel = await OpenChannelAsync(ct);
+                    await channel.QueueDeclarePassiveAsync(dlqName, ct);
+                    await channel.QueueBindAsync(
+                        queue: dlqName, exchange: dlxName, routingKey: topic, cancellationToken: ct);
+                    return channel;
+                }
+
+                await channel.QueueDeclareAsync(
+                    queue: dlqName, durable: durable, exclusive: false,
+                    autoDelete: false, arguments: dlqArgs, cancellationToken: ct);
+
+                _logger.LogInformation(
+                    "Dead-letter queue {Queue} was empty and re-declared with the configured retention arguments",
+                    dlqName);
+            }
 
             await channel.QueueBindAsync(
                 queue: dlqName,
@@ -74,17 +132,25 @@ public sealed class RabbitMqSubscriber : IMessageSubscriber
                 routingKey: topic,
                 cancellationToken: ct);
 
+            return channel;
+        }
+
+        // Factory that creates a fresh channel + consumer, called both for initial
+        // setup and for transparent reconnection after unexpected channel closure.
+        async Task<(IChannel channel, string consumerTag)> CreateChannelAndConsumerAsync(
+            CancellationToken ct)
+        {
+            var channel = await OpenChannelAsync(ct);
+
+            // A subscription that opts out of dead-lettering has no DLQ to declare.
+            if (deadLetter)
+                channel = await DeclareDlqAsync(channel, ct);
+
             // Declare the main queue with dead-letter routing.
             // If the queue already exists with different arguments (e.g. after a
             // topic-scoping upgrade), RabbitMQ returns 406 PRECONDITION_FAILED and
             // kills the channel. We handle that by deleting the stale queue on a
             // fresh channel and retrying.
-            var args = new Dictionary<string, object?>
-            {
-                ["x-dead-letter-exchange"] = dlxName,
-                ["x-dead-letter-routing-key"] = topic
-            };
-
             try
             {
                 await channel.QueueDeclareAsync(
@@ -104,18 +170,13 @@ public sealed class RabbitMqSubscriber : IMessageSubscriber
 
                 // The original channel is dead after a 406; open a new one with the
                 // same concurrency setting as the original.
-                channel = await _connectionManager.CreateChannelAsync(ct, channelConcurrency);
-                await channel.BasicQosAsync(0, prefetchCount, false, cancellationToken: ct);
+                channel = await OpenChannelAsync(ct);
 
                 await channel.QueueDeleteAsync(queueName, cancellationToken: ct);
 
                 // Re-declare DLQ and main queue on the fresh channel
-                await channel.QueueDeclareAsync(
-                    queue: dlqName, durable: durable, exclusive: false,
-                    autoDelete: false, cancellationToken: ct);
-                await channel.QueueBindAsync(
-                    queue: dlqName, exchange: dlxName,
-                    routingKey: topic, cancellationToken: ct);
+                if (deadLetter)
+                    channel = await DeclareDlqAsync(channel, ct);
 
                 await channel.QueueDeclareAsync(
                     queue: queueName, durable: durable, exclusive: false,
@@ -220,8 +281,57 @@ public sealed class RabbitMqSubscriber : IMessageSubscriber
             topic,
             subscriptionName,
             CreateChannelAndConsumerAsync,
-            _logger);
+            _logger,
+            ephemeral ? (queueName, deadLetter ? dlqName : null) : null);
     }
+
+    /// <summary>
+    /// Arguments for a dead-letter queue: retention caps (when enabled) and, for an
+    /// ephemeral subscription, an idle expiry. Shared DLQs never get <c>x-expires</c>:
+    /// a DLQ has no consumer, so the broker would treat it as idle while still in use.
+    /// </summary>
+    internal static Dictionary<string, object?>? BuildDlqArguments(RabbitMqOptions options, SubscriptionOptions subscription)
+    {
+        var args = new Dictionary<string, object?>();
+        var retention = options.DlqRetention;
+        if (retention.Enabled)
+        {
+            args["x-message-ttl"] = retention.MessageTtlMs;
+            args["x-max-length"] = retention.MaxLength;
+            args["x-max-length-bytes"] = retention.MaxLengthBytes;
+            args["x-overflow"] = "drop-head";
+        }
+        if (subscription.Ephemeral)
+            args["x-expires"] = ToMs(subscription.IdleExpiry ?? options.EphemeralQueueExpiry);
+
+        return args.Count > 0 ? args : null;
+    }
+
+    /// <summary>
+    /// Arguments for a subscription's main queue: dead-letter routing (unless the
+    /// subscription opts out), plus the subscription's message TTL and idle expiry.
+    /// An ephemeral subscription falls back to the configured ephemeral defaults.
+    /// </summary>
+    internal static Dictionary<string, object?> BuildQueueArguments(
+        RabbitMqOptions options, string topic, SubscriptionOptions subscription)
+    {
+        var args = new Dictionary<string, object?>();
+        if (subscription.DeadLetter)
+        {
+            args["x-dead-letter-exchange"] = options.DeadLetterExchangeName;
+            args["x-dead-letter-routing-key"] = topic;
+        }
+
+        var expiry = subscription.IdleExpiry ?? (subscription.Ephemeral ? options.EphemeralQueueExpiry : null);
+        var ttl = subscription.MessageTtl ?? (subscription.Ephemeral ? options.EphemeralMessageTtl : null);
+        if (expiry is { } e)
+            args["x-expires"] = ToMs(e);
+        if (ttl is { } t)
+            args["x-message-ttl"] = ToMs(t);
+        return args;
+    }
+
+    private static long ToMs(TimeSpan value) => (long)value.TotalMilliseconds;
 
     private static MessageEnvelope MapToEnvelope(BasicDeliverEventArgs ea)
     {

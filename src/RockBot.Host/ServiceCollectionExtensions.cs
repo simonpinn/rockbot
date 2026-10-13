@@ -45,12 +45,21 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ILlmGateway, LlmGateway>();
         services.AddTransient<ILlmClient, LlmClient>();
         services.AddSingleton<IToolProgressNotifier, ToolProgressNotifier>();
+        // #685: refuses external changes in runs whose originating user message asked for nothing.
+        services.TryAddSingleton<IConsequentialActionGate, ConsequentialActionGate>();
         services.AddTransient<AgentLoopRunner>();
+        // #670: which rarely used tool families each session has loaded; outlives the transient runner.
+        services.TryAddSingleton(_ => new DeferredToolActivations());
         services.AddScoped<AgentContextBuilder>();
         services.AddSingleton<SessionStartTracker>();
         services.AddSingleton<SessionClientCapabilityStore>();
         services.AddSingleton<ReplyAttachmentBuffer>();
         services.AddSingleton<SessionOriginStore>();
+        services.AddSingleton<SessionTierHistory>();
+        // #665: per-conversation record of subagent results and artifacts.
+        services.Configure<SessionWorkRegistryOptions>(_ => { });
+        services.AddSingleton<ISessionWorkRegistry>(sp => new SessionWorkRegistry(
+            sp.GetService<IOptions<SessionWorkRegistryOptions>>()?.Value));
         services.AddSingleton<IUserActivityMonitor, UserActivityMonitor>();
         services.AddSingleton<ISessionTracker, SessionBackgroundTaskTracker>();
         services.AddSingleton<IAgentWorkSerializer, AgentWorkSerializer>();

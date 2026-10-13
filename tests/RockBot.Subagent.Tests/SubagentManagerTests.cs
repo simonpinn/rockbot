@@ -237,6 +237,372 @@ public class SubagentManagerTests
         Assert.AreEqual(0, active.Count);
     }
 
+    // ── Originating user request (#666) ─────────────────────────────────────────
+
+    [TestMethod]
+    public async Task SpawnAsync_RecordsOriginatingUserRequestOnTheEntry()
+    {
+        var (manager, release) = CreateBlockingManager();
+
+        var taskId = await manager.SpawnAsync(
+            "Rebuild the deck at ~30 slides", context: null, timeoutMinutes: 10,
+            primarySessionId: "session/blazor-session", ct: CancellationToken.None,
+            originatingUserRequest: "figure out a way to update the doc");
+        await Task.Delay(100);
+
+        var entry = manager.ListActive().Single(e => e.TaskId == taskId);
+        Assert.AreEqual("figure out a way to update the doc", entry.OriginatingUserRequest);
+
+        release.SetResult(true);
+        await manager.CancelAsync(taskId);
+    }
+
+    [TestMethod]
+    public async Task SpawnAsync_PublishedResultCarriesOriginatingUserRequest()
+    {
+        var publisher = new CapturingPublisher();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        AddSubagentRunnerStubs(services, new NoopLlmClient());
+        services.AddSingleton<IMessagePublisher>(publisher); // last registration wins
+        var provider = services.BuildServiceProvider();
+
+        var manager = new SubagentManager(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new SubagentOptions { MaxConcurrentSubagents = 3 }),
+            publisher,
+            new AgentIdentity("TestBot"),
+            NullLogger<SubagentManager>.Instance);
+
+        await manager.SpawnAsync(
+            "Rebuild the deck", context: null, timeoutMinutes: null,
+            primarySessionId: "session/blazor-session", ct: CancellationToken.None,
+            originatingUserRequest: "trim the deck to about 11 slides");
+
+        var result = await publisher.WaitForResultAsync(TimeSpan.FromSeconds(10));
+        Assert.IsNotNull(result, "the runner should publish a result");
+        Assert.AreEqual("trim the deck to about 11 slides", result.OriginatingUserRequest);
+    }
+
+    // ── Consequential-action scope (#685) ───────────────────────────────────────
+
+    [TestMethod]
+    public async Task SpawnAsync_CapturesTheSpawningRunsActionScope_AsASubagents()
+    {
+        var (manager, release) = CreateBlockingManager();
+        string taskId;
+        using (ActionGateContext.Set(new ActionGateScope(RunOrigin.UserTurn, UserRequestKind.InformationOnly),
+                   new ConsequentialActionGate(Options.Create(new AgentHostOptions()))))
+        {
+            taskId = await manager.SpawnAsync(
+                "Place prep blocks for the talk", context: null, timeoutMinutes: 10,
+                primarySessionId: "session/cli", ct: CancellationToken.None,
+                originatingUserRequest: "the talk doesn't exist yet");
+        }
+        await Task.Delay(100);
+
+        var entry = manager.ListActive().Single(e => e.TaskId == taskId);
+        Assert.AreEqual(new ActionGateScope(RunOrigin.SubagentOfUserTurn, UserRequestKind.InformationOnly), entry.ActionGate);
+
+        release.SetResult(true);
+        await manager.CancelAsync(taskId);
+    }
+
+    [TestMethod]
+    public async Task SpawnAsync_PublishedResultCarriesTheActionScope()
+    {
+        var publisher = new CapturingPublisher();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        AddSubagentRunnerStubs(services, new NoopLlmClient());
+        services.AddSingleton<IMessagePublisher>(publisher); // last registration wins
+        var provider = services.BuildServiceProvider();
+
+        var manager = new SubagentManager(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new SubagentOptions { MaxConcurrentSubagents = 3 }),
+            publisher,
+            new AgentIdentity("TestBot"),
+            NullLogger<SubagentManager>.Instance);
+
+        using (ActionGateContext.Set(new ActionGateScope(RunOrigin.UserTurn, UserRequestKind.InformationOnly),
+                   new ConsequentialActionGate(Options.Create(new AgentHostOptions()))))
+        {
+            await manager.SpawnAsync(
+                "Place prep blocks", context: null, timeoutMinutes: null,
+                primarySessionId: "session/cli", ct: CancellationToken.None);
+        }
+
+        var result = await publisher.WaitForResultAsync(TimeSpan.FromSeconds(10));
+        Assert.IsNotNull(result, "the runner should publish a result");
+        Assert.AreEqual("subagent-of-user-turn", result.RunOrigin);
+        Assert.AreEqual("information-only", result.UserAskedFor);
+        Assert.AreEqual(new ActionGateScope(RunOrigin.UserTurn, UserRequestKind.InformationOnly),
+            ActionGateScope.FromRelayedResults([result]), "the synthesis turn runs under the same gate");
+    }
+
+    [TestMethod]
+    public void CapOriginatingRequest_BlankIsNull_LongIsCapped()
+    {
+        Assert.IsNull(SubagentManager.CapOriginatingRequest("   "));
+        Assert.IsNull(SubagentManager.CapOriginatingRequest(null));
+        Assert.AreEqual(SubagentManager.MaxOriginatingRequestChars,
+            SubagentManager.CapOriginatingRequest(new string('x', 10_000))!.Length);
+    }
+
+    // ── Subagent lineage (#665) ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Mirrors the 2026-10-10 replay of session cli-deck-01612: turn m2 spawned a research subagent
+    /// whose grounded summary (stateless core, server/discover, MRTR …) was saved to working memory;
+    /// two turns later the deck subagent's context did not include it and the deck mentioned none of
+    /// it. The deck subagent must now start with the research inlined and its key listed — without
+    /// the primary passing anything.
+    /// </summary>
+    [TestMethod]
+    public async Task DeckSubagent_AfterResearchSubagent_StartsWithTheResearch()
+    {
+        const string ResearchKey = "subagent/6a393b675e2f/mcp-2026-07-28-primary-source-summary";
+        const string Research =
+            "MCP 2026-07-28 primary-source summary: stateless per-request versioning via _meta / " +
+            "MCP-Protocol-Version; server/discover replaces the initialize handshake; capability and " +
+            "extension negotiation; MRTR InputRequiredResult / inputResponses; Streamable HTTP; Origin validation.";
+
+        var memory = new DictionaryWorkingMemory();
+        memory.Values[ResearchKey] = Research;
+        memory.Values["subagent/6a393b675e2f/web-https___modelcontextprotocol.io_spec-chunk0"] = "raw page";
+
+        var registry = new SessionWorkRegistry();
+        // The research result as SubagentResultHandler records it when it arrives (turn m2).
+        registry.RecordSubagentResult("session/cli-deck-01612", SubagentWorkResult.Create(
+            "6a393b675e2f",
+            "Research the key features of the MCP version 2 spec (2026-07-28) from primary sources",
+            "Grounded summary saved. Key changes: stateless core, server/discover, MRTR. " +
+            $"Saved to {ResearchKey}.",
+            [ResearchKey, "subagent/6a393b675e2f/web-https___modelcontextprotocol.io_spec-chunk0"],
+            isSuccess: true, DateTimeOffset.UtcNow.AddMinutes(-6)));
+        // An earlier, unrequested draft the primary wrote (the file the bad deck was based on).
+        registry.RecordToolCall("cli-deck-01612", "file_write",
+            [new("path", "drafts/techorama-nl-mcp-v2-production-deck.md"), new("content", "old draft")], true);
+
+        var llm = new CapturingLlmClient();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        AddSubagentRunnerStubs(services, llm);
+        services.AddSingleton<IWorkingMemory>(memory);
+        services.AddSingleton<ISessionWorkRegistry>(registry);
+        var provider = services.BuildServiceProvider();
+
+        var manager = new SubagentManager(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new SubagentOptions()),
+            provider.GetRequiredService<IMessagePublisher>(),
+            new AgentIdentity("TestBot"),
+            NullLogger<SubagentManager>.Instance,
+            registry);
+
+        // Turn m4: "create a Slidev deck" — no context, no inputs, no key passed by the primary.
+        var taskId = await manager.SpawnAsync(
+            "Create a Slidev deck for the Techorama talk on MCP v2", context: null, timeoutMinutes: null,
+            primarySessionId: "session/cli-deck-01612", ct: CancellationToken.None,
+            originatingUserRequest: "create a Slidev deck");
+        Assert.IsFalse(taskId.StartsWith("Error:"), taskId);
+
+        var messages = await llm.FirstCall.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var context = string.Join("\n", messages.Select(m => m.Text));
+
+        StringAssert.Contains(context, "Prior work in this conversation");
+        StringAssert.Contains(context, "server/discover", "the research must be inlined into the deck subagent's context");
+        StringAssert.Contains(context, ResearchKey, "the research key must be listed");
+        StringAssert.Contains(context, "drafts/techorama-nl-mcp-v2-production-deck.md", "files written so far are listed");
+        StringAssert.Contains(context, "the research wins");
+        StringAssert.Contains(context, "create a Slidev deck", "the originating user request is shown");
+        Assert.IsFalse(context.Contains("raw page"), "bulk web chunks are counted, not inlined");
+    }
+
+    [TestMethod]
+    public async Task SpawnAsync_LinksTheSubagentSessionToThePrimary()
+    {
+        var registry = new SessionWorkRegistry();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        AddSubagentRunnerStubs(services, new NoopLlmClient());
+        var provider = services.BuildServiceProvider();
+        var manager = new SubagentManager(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new SubagentOptions()),
+            provider.GetRequiredService<IMessagePublisher>(),
+            new AgentIdentity("TestBot"),
+            NullLogger<SubagentManager>.Instance,
+            registry);
+
+        var taskId = await manager.SpawnAsync("Quick task", null, null, "session/s1", CancellationToken.None);
+
+        Assert.AreEqual("s1", registry.ResolveRootSession($"subagent-{taskId}"));
+        Assert.AreEqual("s1", registry.ResolveRootSession($"subagent/{taskId}"));
+    }
+
+    [TestMethod]
+    public async Task SpawnAsync_ResearchTaskWithLowCap_RunsWithTheFloor()
+    {
+        var publisher = new CapturingPublisher();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        AddSubagentRunnerStubs(services, new NoopLlmClient());
+        services.AddSingleton<IMessagePublisher>(publisher);
+        var provider = services.BuildServiceProvider();
+        var capturing = new ListLogger<SubagentManager>();
+        var manager = new SubagentManager(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new SubagentOptions()),
+            publisher,
+            new AgentIdentity("TestBot"),
+            capturing);
+
+        await manager.SpawnAsync("Research the MCP v2 spec and outline a talk", null, null,
+            "session/s1", CancellationToken.None, maxIterations: 8);
+
+        Assert.IsTrue(capturing.Messages.Any(m => m.Contains("raised max_iterations from 8 to 20")),
+            string.Join("\n", capturing.Messages));
+        Assert.IsNotNull(await publisher.WaitForResultAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    /// <summary>
+    /// #683: the subagent's own tool calls travel on its result, so the primary's synthesis check
+    /// sees the write and upload the report describes.
+    /// </summary>
+    [TestMethod]
+    public async Task SubagentResult_CarriesTheRunsToolCalls()
+    {
+        var publisher = new CapturingPublisher();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        AddSubagentRunnerStubs(services, new LedgerRecordingLlmClient());
+        services.AddSingleton<IMessagePublisher>(publisher);
+        var provider = services.BuildServiceProvider();
+        var manager = new SubagentManager(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new SubagentOptions()),
+            publisher,
+            new AgentIdentity("TestBot"),
+            NullLogger<SubagentManager>.Instance);
+
+        await manager.SpawnAsync("Revise the deck and upload it", null, null, "session/s1", CancellationToken.None);
+        var result = await publisher.WaitForResultAsync(TimeSpan.FromSeconds(10));
+
+        Assert.IsNotNull(result);
+        Assert.AreEqual(2, result.ToolCallCount);
+        Assert.IsNotNull(result.ToolCalls);
+        Assert.AreEqual(new SubagentToolCallSummary("file_write", true, true, "path=deck.md"), result.ToolCalls[0]);
+        Assert.AreEqual("mcp_invoke_tool → upload_file", result.ToolCalls[1].Name);
+        Assert.IsTrue(result.ToolCalls[1].ChangesState);
+    }
+
+    /// <summary>Stands in for the FICC: records a write and an upload into the run's ledger, then answers.</summary>
+    private sealed class LedgerRecordingLlmClient : ILlmClient
+    {
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            if (LoopToolCallLedgerContext.Value is { } ledger && ledger.Snapshot().Count == 0)
+            {
+                ledger.Record("file_write", "path=deck.md", succeeded: true);
+                ledger.Record("mcp_invoke_tool", "server_name=onedrive, tool_name=upload_file, path=/Talks/deck.md", succeeded: true);
+            }
+            return Task.FromResult(new ChatResponse([new ChatMessage(ChatRole.Assistant, "Deck revised and uploaded.")]));
+        }
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ModelTier tier, ChatOptions? options = null,
+            CancellationToken cancellationToken = default) =>
+            GetResponseAsync(messages, options, cancellationToken);
+    }
+
+    private sealed class ListLogger<T> : ILogger<T>
+    {
+        public List<string> Messages { get; } = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (Messages) Messages.Add(formatter(state, exception));
+        }
+    }
+
+    /// <summary>LLM client that records the messages of its first call, then answers immediately.</summary>
+    private sealed class CapturingLlmClient : ILlmClient
+    {
+        public TaskCompletionSource<IReadOnlyList<ChatMessage>> FirstCall { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            FirstCall.TrySetResult(messages.ToList());
+            return Task.FromResult(new ChatResponse([new ChatMessage(ChatRole.Assistant, "Deck written.")]));
+        }
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ModelTier tier, ChatOptions? options = null,
+            CancellationToken cancellationToken = default) =>
+            GetResponseAsync(messages, options, cancellationToken);
+    }
+
+    private sealed class DictionaryWorkingMemory : IWorkingMemory
+    {
+        public System.Collections.Concurrent.ConcurrentDictionary<string, string> Values { get; } = new();
+
+        public Task SetAsync(string key, string value, TimeSpan? ttl = null, string? category = null,
+            IReadOnlyList<string>? tags = null)
+        {
+            Values[key] = value;
+            return Task.CompletedTask;
+        }
+
+        public Task<string?> GetAsync(string key) =>
+            Task.FromResult(Values.TryGetValue(key, out var v) ? v : null);
+
+        public Task<IReadOnlyList<WorkingMemoryEntry>> ListAsync(string? prefix = null) =>
+            Task.FromResult<IReadOnlyList<WorkingMemoryEntry>>(Values
+                .Where(kv => prefix is null || kv.Key.StartsWith(prefix, StringComparison.Ordinal))
+                .Select(kv => new WorkingMemoryEntry(kv.Key, kv.Value, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow.AddHours(1)))
+                .ToList());
+
+        public Task DeleteAsync(string key)
+        {
+            Values.TryRemove(key, out _);
+            return Task.CompletedTask;
+        }
+
+        public Task ClearAsync(string? prefix = null) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<WorkingMemoryEntry>> SearchAsync(MemorySearchCriteria criteria, string? prefix = null) =>
+            ListAsync(prefix);
+    }
+
+    private sealed class CapturingPublisher : IMessagePublisher
+    {
+        private readonly TaskCompletionSource<SubagentResultMessage> _result =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task PublishAsync(string topic, MessageEnvelope envelope, CancellationToken cancellationToken = default)
+        {
+            if (topic.StartsWith(SubagentTopics.Result, StringComparison.Ordinal)
+                && envelope.GetPayload<SubagentResultMessage>() is { } result)
+                _result.TrySetResult(result);
+            return Task.CompletedTask;
+        }
+
+        public async Task<SubagentResultMessage?> WaitForResultAsync(TimeSpan timeout)
+        {
+            var done = await Task.WhenAny(_result.Task, Task.Delay(timeout));
+            return done == _result.Task ? _result.Task.Result : null;
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
     // ── ISubagentSessionResolver ────────────────────────────────────────────────
 
     [TestMethod]

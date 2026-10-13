@@ -224,6 +224,26 @@ public static class HostDiagnostics
             advice: new InstrumentAdvice<long> { HistogramBucketBoundaries = ContextTokenBuckets });
 
     /// <summary>
+    /// Provider-reported input tokens of each single LLM request (#670) — every iteration of the
+    /// function-invoking loop separately, unlike <see cref="TurnTokensInput"/>. Tagged with
+    /// <c>rockbot.llm.tier</c> and <c>rockbot.session.kind</c>.
+    /// </summary>
+    public static readonly Histogram<long> LlmRequestTokensInput =
+        Meter.CreateHistogram<long>(
+            "rockbot.llm.request.tokens.input",
+            unit: "{token}",
+            description: "Provider-reported input tokens of each single LLM request",
+            tags: null,
+            advice: new InstrumentAdvice<long> { HistogramBucketBoundaries = ContextTokenBuckets });
+
+    /// <summary>Number of tools sent with each single LLM request (#670).</summary>
+    public static readonly Histogram<long> LlmRequestTools =
+        Meter.CreateHistogram<long>(
+            "rockbot.llm.request.tools",
+            unit: "{tool}",
+            description: "Tools sent with each single LLM request");
+
+    /// <summary>
     /// A content part whose type <c>AgentLoopRunner.EstimateContentChars</c> does not model
     /// appeared in the message list and was charged the flat placeholder size. Tagged with
     /// <c>rockbot.content.type</c> (the CLR type name) so the specific gap is identifiable.
@@ -258,6 +278,16 @@ public static class HostDiagnostics
             "rockbot.agent.completion_check.skipped",
             unit: "{check}",
             description: "Completion evaluation skipped due to force termination");
+
+    /// <summary>
+    /// A tool call that would change an external system was refused because the originating user
+    /// message asked for nothing (#685). Tagged <c>rockbot.tool.name</c> and <c>rockbot.action_gate.origin</c>.
+    /// </summary>
+    public static readonly Counter<long> ConsequentialActionGated =
+        Meter.CreateCounter<long>(
+            "rockbot.agent.consequential_action.gated",
+            unit: "{call}",
+            description: "External-change tool calls refused because the user did not ask for them");
 
     // ── Follow-up passes ──────────────────────────────────────────────────
 

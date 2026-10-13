@@ -360,6 +360,8 @@ builder.Services.AddRockBotHost(agent =>
     agent.WithDreaming(opts => builder.Configuration.GetSection("Dream").Bind(opts));
     agent.WithMemoryAudit(opts => builder.Configuration.GetSection("MemoryAudit").Bind(opts));
     agent.AddToolHandler();
+    // #685: convert_time, so cross-zone times use the DST rules of the date in question.
+    agent.AddTimeTools();
     // The proxy must outwait the bridge: the bridge caps a tool call at MaxTimeoutMs
     // (15 min) and answers with a timeout response of its own. If the proxy gave up
     // first the caller would see a transport failure instead of that response.
@@ -433,6 +435,7 @@ builder.Services.AddRockBotHost(agent =>
     agent.HandleMessage<ScheduledTaskMessage, ScheduledTaskHandler>();
     agent.HandleMessage<UserMessage, UserMessageHandler>();
     agent.HandleMessage<UserFeedback, UserFeedbackHandler>();
+    agent.HandleMessage<McpQuestionAnswer, McpQuestionAnswerHandler>();
     agent.HandleMessage<CancelSessionRequest, CancelSessionHandler>();
     agent.HandleMessage<ClearContextRequest, ClearContextHandler>();
     agent.HandleMessage<ConversationHistoryRequest, ConversationHistoryRequestHandler>();
@@ -446,6 +449,7 @@ builder.Services.AddRockBotHost(agent =>
     agent.HandleMessage<AttachmentUploadRequest, AttachmentUploadHandler>();
     agent.SubscribeTo($"{UserProxyTopics.UserMessage}.{agentName}");
     agent.SubscribeTo($"{UserProxyTopics.UserFeedback}.{agentName}");
+    agent.SubscribeTo($"{UserProxyTopics.McpAnswer}.{agentName}");
     agent.SubscribeTo($"{UserProxyTopics.CancelSession}.{agentName}");
     agent.SubscribeTo($"{UserProxyTopics.ClearContext}.{agentName}");
     agent.SubscribeTo($"{UserProxyTopics.ConversationHistoryRequest}.{agentName}");
@@ -464,6 +468,11 @@ builder.Services.Configure<AgentProfileOptions>(builder.Configuration.GetSection
 
 // Allow MaxToolIterations and other AgentHostOptions to be overridden via appsettings.json or env vars.
 builder.Services.Configure<AgentHostOptions>(builder.Configuration.GetSection("AgentHost"));
+
+// Working memory — e.g. WorkingMemory__SnapshotStaleAfter=08:00:00 or
+// WorkingMemory__SnapshotKeyPrefixes__0=shared/patrol/ (issue #668). Composes with the
+// defaults registered by WithMemory(); unset keys keep their defaults.
+builder.Services.Configure<WorkingMemoryOptions>(builder.Configuration.GetSection("WorkingMemory"));
 
 // LLM pricing — loaded from a JSON file on the agent PVC so prices can be refreshed
 // without rebuilding the image. LlmPricing__ConfigPath in the ConfigMap overrides the default.
@@ -490,6 +499,8 @@ builder.Services.AddHostedService<AttachmentUploadEndpoint>();
 // MCP bridge (replaces external RockBot.Tools.Mcp.Bridge process)
 var mcpBridgeSection = builder.Configuration.GetSection("McpBridge");
 builder.Services.Configure<McpBridgeOptions>(mcpBridgeSection);
+// The model-facing tool surface reads the same section: McpBridge:WrapperMode selects typed wrappers.
+builder.Services.Configure<RockBot.Tools.Mcp.McpToolSurfaceOptions>(mcpBridgeSection);
 // ConfigurationBinder cannot bind the elicitation defaults dictionary; read it explicitly.
 builder.Services.PostConfigure<McpBridgeOptions>(options =>
     (options.DefaultElicitation ??= new()).Defaults = McpBridgeOptions.ReadElicitationDefaults(mcpBridgeSection));

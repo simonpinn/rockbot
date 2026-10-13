@@ -29,10 +29,27 @@ public sealed partial class AgentLoopRunner(
     IEnumerable<IServiceSearchIndex> serviceSearchIndexProviders,
     IConversationMemory conversationMemory,
     ILogger<AgentLoopRunner> logger,
-    InjectedMemoryTracker? injectedMemoryTracker = null)
+    InjectedMemoryTracker? injectedMemoryTracker = null,
+    ITypedToolSurface? typedToolSurface = null,
+    ISessionWorkRegistry? sessionWorkRegistry = null,
+    IConsequentialActionGate? consequentialActionGate = null,
+    DeferredToolActivations? deferredToolActivations = null)
 {
+    // #670: which deferred tool families each session has loaded. Process-wide: the runner is
+    // transient, and a family loaded on one turn stays in the session's list on the next.
+    private readonly DeferredToolActivations _deferredActivations =
+        deferredToolActivations ?? DeferredToolActivations.Shared;
+
     private readonly IServiceSearchIndex? _serviceSearchIndex = serviceSearchIndexProviders.FirstOrDefault();
+
+    // #685: consulted before every tool call through ActionGateContext. Hosts that construct the
+    // runner by hand still get the configured gate.
+    private readonly IConsequentialActionGate _actionGate =
+        consequentialActionGate ?? new ConsequentialActionGate(hostOptions);
     private const int MaxConsecutiveTimeoutIterations = 2;
+
+    /// <summary>The <c>rockbot.tool.status</c> of a call the consequential-action gate refused (#685).</summary>
+    internal const string ConsequentialActionGatedStatus = "gated";
 
     /// <summary>
     /// Detects when a model claims to have performed tool actions in plain text without
@@ -74,9 +91,12 @@ public sealed partial class AgentLoopRunner(
         @"|\bNo\s+tools\s+were\s+invoked\b",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    public const string CapabilityDenialNudge =
-        "Before concluding you lack access, check what services are available using " +
-        "mcp_list_services or search_known_services, then use mcp_invoke_tool to call them.";
+    /// <summary>
+    /// The nudge after the model claims it lacks a capability, worded for the run's typed-tool
+    /// mode (#614) so it doesn't steer a typed-tool run back to mcp_invoke_tool.
+    /// </summary>
+    private string CapabilityDenialNudge() =>
+        "Before concluding you lack access, check what services are available. " + HowToReachServices();
 
     /// <summary>
     /// Detects internal tool-call scaffolding that has leaked into the model's text output
@@ -301,23 +321,68 @@ public sealed partial class AgentLoopRunner(
 
     private const string CompletionEvaluatorPrompt =
         """
-        You are a task-completion evaluator. Given an original user request and an
-        agent's response, determine whether the agent fully completed the requested task.
+        You are a task-completion evaluator. You receive the user's recent messages (the last
+        one is what the agent is answering), the list of tool calls the agent actually made
+        this turn, and the agent's response. Decide whether the response fully and truthfully
+        delivers what the user asked for.
 
-        Rules:
-        - "Complete" means the agent performed the actions requested and reported results.
-        - If the agent only described what it would do, narrated a plan, or gave a partial
-          answer without taking action, that is INCOMPLETE.
-        - If the agent said it completed the task and the response contains evidence of
-          completion (specific data, confirmation of actions taken), that is COMPLETE.
-        - If the original request was a simple question and the agent answered it, that
-          is COMPLETE.
-        - If the agent encountered a SPECIFIC tool error (timeout, auth failure, API error)
-          and explained it clearly, that is COMPLETE.
-        - IMPORTANT: If the agent claimed it lacks access to a service, cannot connect,
-          or does not have the right tools — WITHOUT actually trying to call any tools
-          first — that is INCOMPLETE. The agent should attempt to use its tools before
-          concluding it cannot do something.
+        Work through these questions in order:
+        1. What did the user ask for? List every concrete requirement: counts, sizes, durations,
+           format, location (which file or document), and constraints — including ones stated in
+           earlier messages, and quantities that follow from them (for example, a 30-minute talk
+           at 3 minutes per slide means about 10 slides).
+        2. Was it delivered? A question answered correctly is delivered. An instruction ("do it",
+           "update the doc", "cut the slides", "search for it") is delivered only if the tool
+           calls show the action was actually taken.
+        3. Does any number or claim in the response contradict a constraint the user gave or a
+           fact in the conversation? A count the user never gave, or a figure that does not
+           follow from the user's own numbers, means INCOMPLETE.
+        4. Is any action the response claims ("Updated.", "Done.", "I've trimmed it…") unsupported
+           by the tool calls listed? If no listed tool call could have done it, that is INCOMPLETE.
+        5. Does the response promise, plan or apologise for work ("I should have…", "I'll search…",
+           "Let me…", "I've got the right path…") that the agent could have done now with its
+           tools? That is INCOMPLETE.
+
+        Also:
+        - If the agent hit a SPECIFIC tool error (timeout, auth failure, API error) and explained
+          it clearly, that is COMPLETE.
+        - If the agent claimed it lacks access to a service, cannot connect, or does not have the
+          right tools — WITHOUT trying to call any tools first — that is INCOMPLETE.
+        - If the request is genuinely ambiguous and the agent asked one necessary clarifying
+          question instead of guessing, that is COMPLETE.
+        - When an "Original user request" section is present, the agent is relaying a subagent's
+          result: judge it against that original request, not against the subagent's own task
+          description or self-report.
+        - When a "Tool calls made by subagent …" section is present, that subagent did the relayed
+          work in its own session. A claim in the relayed report (a file written, a deck uploaded,
+          a read-back verified) is supported when that subagent's tool calls show it; the agent's
+          own tool calls this turn (typically reading the subagent's saved output) will not show
+          it and need not. Judge the agent's own calls separately, only for what the agent says it
+          did itself this turn. A relayed claim that neither list supports is unsupported
+          (question 4). If a subagent's tool calls are "not reported", do not mark the reply
+          INCOMPLETE only because the agent's own calls lack the relayed work.
+        - Lines starting "↳" under a call (for example spawn_wisps) are calls that batch tool made
+          on the agent's behalf, each with its own outcome. A claimed count of things created,
+          scheduled, sent, updated or verified must match the successful calls that did them: a
+          reply that claims seven events when one create succeeded and six FAILED is INCOMPLETE,
+          and the reason names both numbers. A batch call marked FAILED (for example "6 of 7
+          wisps failed") did not do all its work, even when parts of it succeeded.
+        - The "What the user asked for" section says "UserAskedFor: instruction" or
+          "UserAskedFor: information-only". For information-only, the user's message gave no
+          instruction (it shared context or information, or asked a question): skip questions 1–2
+          except that a question asked must be answered, and judge only whether the reply's facts,
+          numbers and claims are supported and accurately stated (questions 3–5). That the user's
+          wider goal implies more work this message did not ask for is NOT a reason for INCOMPLETE.
+          A claim that the agent or a subagent created, updated, wrote, saved, scheduled or
+          verified something this turn is still a claim: it needs a successful call that did it,
+          in the agent's calls or the relayed ones (question 4).
+        - An "External changes the user did not ask for" section means the agent (or a subagent it
+          relays) changed a calendar, mailbox, the user's files or todos, or other external data
+          although the user's message asked for nothing. That is INCOMPLETE, with a reason starting
+          "unrequested external change:" that names what changed.
+
+        In "reason", name the specific unmet requirement, contradicted number or unsupported
+        claim, so the agent can fix it.
 
         Return ONLY a valid JSON object — no markdown, no code fences.
         {"complete": true, "reason": "brief explanation"}
@@ -356,6 +421,8 @@ public sealed partial class AgentLoopRunner(
 
         ## Bad follow-ups (NEVER suggest these):
         - Anything the agent already did in its response
+        - Creating, changing, sending or deleting anything in the user's external systems
+          (calendar events, mail, files in their accounts, todos) that the user did not ask for
         - Generic offers ("would you like me to...") — the agent should ACT, not ask
         - Unrelated tangents or speculative actions
         - Repeating searches or lookups the agent already performed
@@ -404,15 +471,49 @@ public sealed partial class AgentLoopRunner(
         double? complexityScore = null,
         int? maxIterationsOverride = null,
         LoopDiagnostics? diagnostics = null,
-        CancellationToken cancellationToken = default)
+        // Mid-turn tier escalation (#663): when true and the run is routed Low, a
+        // side-effecting tool call or repeated tool errors move the rest of the loop to
+        // Balanced. Opt-in so pinned tiers and background paths keep their tier.
+        bool allowTierEscalation = false,
+        CancellationToken cancellationToken = default,
+        // #666: true when this loop relays a subagent's result to the user. The completion
+        // evaluator then always runs, judged against originatingUserRequest when it is known.
+        bool subagentSynthesis = false,
+        // #666: the user request this loop ultimately serves when the latest user-role message is
+        // not it (a subagent synthesis turn's latest message is the subagent's report).
+        string? originatingUserRequest = null,
+        // #683: for a subagent synthesis, the tool calls (and recorded artifacts) of each subagent
+        // whose result this loop relays, so the evaluator can check the relayed claims against them.
+        IReadOnlyList<RelayedSubagentWork>? relayedWork = null,
+        // #685: what started this run, for the consequential-action gate. Null inherits the scope
+        // of the run this one is nested in (wisp LLM steps, workers, subagents spawned in-flow);
+        // with no enclosing run it is RunOrigin.Unknown, which allows external changes.
+        ActionGateScope? actionGate = null,
+        // #686: when set, the completion evaluator runs only for these triggers. The first one that
+        // matches wins; a disabled trigger never hides a later enabled one. Subagents use this to
+        // check their own claims of work before reporting back.
+        IReadOnlySet<CompletionEvalTrigger>? completionEvalTriggers = null,
+        // #670: when true (and AgentHost:DeferRareToolFamilies is on), rarely used tool families
+        // stay out of the list until the session loads them. Interactive turns opt in; background,
+        // subagent and wisp runs keep the list their caller built.
+        bool deferRareTools = false)
     {
         using var _ = ToolCallSessionContext.Set(sessionId);
+        // Always bind (possibly null) so a nested run — a subagent started from a tool call —
+        // never inherits the parent run's escalation state.
+        using var escalationScope = TierEscalationContext.Set(
+            allowTierEscalation && tier == ModelTier.Low
+                ? new TierEscalationContext.State(tier, logger, diagnostics)
+                : null);
         // Set the per-async-flow override so RockBotFunctionInvokingChatClient
         // (singleton, native path) picks it up for this request.
         using var __ = MaxIterationsOverrideContext.Set(maxIterationsOverride);
         // Expose the per-call diagnostics handle to the native FICC so it can
         // record per-tool-call state from its singleton context.
         using var ___ = LoopDiagnosticsContext.Set(diagnostics);
+        // #670: every request this run sends is measured into this scope, which logs the
+        // per-turn summary (per-request median/max, sums) when the run returns.
+        using var requestAccounting = RequestAccountingContext.Begin(sessionId, logger, diagnostics);
         // Per-run stash state (issue #337): registry of overflow-trimmed tool results
         // plus a callId→argsSummary dictionary so the native path can contribute the
         // argument summaries it sees on dispatch. Exposed via AsyncLocal so the FICC
@@ -425,6 +526,26 @@ public sealed partial class AgentLoopRunner(
         // lets the FICC inner loop unload bodies the model isn't actively re-using.
         var loadedSkillsState = new LoadedSkillsContext.State();
         using var _____ = LoadedSkillsContext.Set(loadedSkillsState);
+
+        // Typed MCP tools: the run's tier picks the mode (#613), which fits the registry's tools
+        // to it. Lazily, tools this session activated on earlier turns join the list now; ones
+        // it activates during the run join before the next LLM request (#612).
+        using var ______ = TypedToolSurfaceContext.Set(typedToolSurface, tier);
+        TypedToolSurfaceContext.Shape(chatOptions);
+        TypedToolSurfaceContext.AddActivated(chatOptions);
+        EnsureMcpOrientation(chatMessages, chatOptions);
+
+        // Rarely used tool families wait until the session asks for them (#670). Always bound
+        // (possibly to nothing) so a nested run never inherits its parent's pool.
+        using var deferredScope = DeferredToolContext.Set(
+            deferRareTools && hostOptions.Value.DeferRareToolFamilies ? _deferredActivations : null,
+            sessionId, logger);
+        var deferredCount = DeferredToolContext.Partition(chatOptions);
+        if (deferredCount > 0)
+            EnsureDeferredToolsOrientation(chatMessages);
+
+        // MCP hand-back: a server's mid-call question comes back to this run only if it can answer.
+        using var _______ = McpHandbackContext.Set(chatOptions);
 
         // Ensure a current datetime context is always present.
         EnsureDateTimeContext(chatMessages);
@@ -459,6 +580,46 @@ public sealed partial class AgentLoopRunner(
         }
 
         var originalUserRequest = ExtractOriginalUserRequest(chatMessages);
+
+        // #666: every tool call this run makes, for the completion evaluator's gate and input.
+        // Kept outside the chat history, which context trimming can shorten.
+        // #665: the same hook records the files and uploads this run writes, for later turns and subagents.
+        var toolCallLedger = new LoopToolCallLedger(sessionWorkRegistry is null || string.IsNullOrEmpty(sessionId)
+            ? null
+            : (name, rawArgs, ok) => sessionWorkRegistry.RecordToolCall(sessionId!, name, rawArgs, ok));
+        using var ________ = LoopToolCallLedgerContext.Set(toolCallLedger);
+        // #683: the caller's handle on the run's calls — SubagentRunner carries them on its result.
+        if (diagnostics is not null)
+            diagnostics.ToolCallLedger = toolCallLedger;
+
+        // #666: the user request this run serves, for tools that start work whose result comes
+        // back later (spawn_subagent records it so the synthesis turn is checked against it).
+        var servedUserRequest = string.IsNullOrWhiteSpace(originatingUserRequest)
+            ? originalUserRequest
+            : originatingUserRequest;
+        using var _________ = OriginatingUserRequestContext.Set(servedUserRequest);
+
+        // Captured before any re-prompt nudge joins the history, so the evaluator reads only
+        // what the user actually said.
+        var recentUserMessages = ExtractRecentUserMessages(chatMessages, CompletionEvalTriggers.RecentUserMessageCount);
+        var previousAgentMessage = ExtractPreviousAgentMessage(chatMessages);
+
+        // #683: the user message the reply is judged against, and whether it asked for anything.
+        // A synthesis turn's latest user-role message is the subagent's report, so it is judged
+        // against the request behind the spawn; when that is unknown, the full rubric applies.
+        var judgedUserRequest = subagentSynthesis
+            ? (string.IsNullOrWhiteSpace(originatingUserRequest) ? null : originatingUserRequest)
+            : originalUserRequest;
+        var userAskedFor = CompletionEvalTriggers.ClassifyUserRequest(
+            judgedUserRequest, followsAgentMessage: subagentSynthesis || previousAgentMessage is not null);
+
+        // #685: the consequential-action gate's scope for every tool call this run (and anything it
+        // starts) makes. A user turn whose scope carries no classification is judged by the same
+        // request the evaluator judges: a bare "yes" after an agent proposal is an instruction.
+        var gateScope = ResolveActionGateScope(actionGate, ActionGateContext.Scope, userAskedFor);
+        using var __________ = ActionGateContext.Set(gateScope, _actionGate);
+        var externalChangesNeedRequest = gateScope.RequiresUserInstruction;
+
         var maxReprompts = modelBehavior.MaxCompletionRepromptsOverride
             ?? hostOptions.Value.MaxCompletionReprompts;
         var alreadyNudgedToolFailure = false;
@@ -606,27 +767,39 @@ public sealed partial class AgentLoopRunner(
             // subagent is intentional delegation — the SubagentResultHandler will
             // synthesize and publish the result. Re-prompting here would race with
             // that handler and produce duplicate answers.
-            if (chatMessages.Any(m => m.Contents.OfType<FunctionCallContent>()
-                    .Any(fc => fc.Name is "spawn_subagent" or "invoke_agent")))
+            //
+            // The synthesis turn (subagentSynthesis) is checked instead, against the user's
+            // original request. The ledger also sees text-parsed calls, which never become
+            // FunctionCallContent in the history.
+            var loopToolCalls = toolCallLedger.Snapshot();
+            if (loopToolCalls.Any(c => ToolSideEffects.IsDelegation(c.Name))
+                || chatMessages.Any(m => m.Contents.OfType<FunctionCallContent>()
+                    .Any(fc => ToolSideEffects.IsDelegation(fc.Name))))
             {
                 HostDiagnostics.CompletionCheckSkipped.Add(1);
                 logger.LogInformation("Completion evaluator: SKIPPED (delegated to subagent/agent)");
                 return FinalizeResponse(result.Response, chatMessages, originalUserRequest);
             }
 
-            // Heuristic short-circuit: if the model stopped naturally and the response
-            // passes basic quality checks, skip the evaluator LLM call. The hallucination
-            // and capability denial patterns are the primary triggers for INCOMPLETE verdicts;
-            // when neither fires, the evaluator almost always returns complete.
-            if (result.ExitReason == LoopExitReason.ModelStopped
-                && result.Response.Length >= 20
-                && !HallucinatedActionRegex.IsMatch(result.Response)
-                && !CapabilityDenialRegex.IsMatch(result.Response))
+            // Gate (#666): run the evaluator when the turn changed something, relays a subagent
+            // result, answers an instruction without any tool call, promises work it didn't do,
+            // opens with a bare "Done."/"Updated." — or trips the original hallucination /
+            // capability-denial / short-reply gate. Otherwise skip the LLM call: a plain answer
+            // to a question almost always evaluates complete.
+            var trigger = CompletionEvalTriggers.Decide(
+                result.Response,
+                originalUserRequest,
+                loopToolCalls,
+                subagentSynthesis,
+                modelStopped: result.ExitReason == LoopExitReason.ModelStopped,
+                enabled: completionEvalTriggers);
+
+            if (trigger == CompletionEvalTrigger.None)
             {
                 HostDiagnostics.CompletionCheckSkipped.Add(1);
                 logger.LogInformation(
-                    "Completion evaluator: SKIPPED (model stopped, {ResponseLen} chars, no hallucination/denial patterns)",
-                    result.Response.Length);
+                    "Completion evaluator: SKIPPED (model stopped, {ResponseLen} chars, {ToolCalls} tool call(s), no trigger)",
+                    result.Response.Length, loopToolCalls.Count);
 
                 if (!enableFollowUp || reprompt > 0)
                 {
@@ -652,19 +825,40 @@ public sealed partial class AgentLoopRunner(
                 }
             }
 
-            // Full evaluator path: response may be incomplete (short, hallucinated, or denial).
+            // Full evaluator path.
+            var triggerName = CompletionEvalTriggers.LogName(trigger);
+            var askedForName = CompletionEvalTriggers.LogName(userAskedFor);
+            var triggerTag = new KeyValuePair<string, object?>("rockbot.completion_check.trigger", triggerName);
+            var askedForTag = new KeyValuePair<string, object?>("rockbot.completion_check.user_asked_for", askedForName);
+            var relayedForEval = trigger == CompletionEvalTrigger.SubagentSynthesis ? relayedWork : null;
+            logger.LogInformation(
+                "Completion evaluator: RUN (trigger={Trigger}, userAskedFor={UserAskedFor}) — {ToolCalls} tool call(s), " +
+                "{RelayedCalls} relayed subagent call(s), {ResponseLen} chars",
+                triggerName, askedForName, loopToolCalls.Count,
+                relayedForEval?.Sum(w => w.ToolCalls?.Count ?? 0) ?? 0, result.Response.Length);
+
             if (onStageProgress is not null)
                 await onStageProgress("Reviewing response…", cancellationToken);
 
             var (complete, reason) = await EvaluateCompletionAsync(
-                originalUserRequest, result.Response, cancellationToken);
+                new CompletionEvalTriggers.EvaluatorInput(
+                    recentUserMessages,
+                    previousAgentMessage,
+                    string.IsNullOrWhiteSpace(originatingUserRequest) ? null : originatingUserRequest,
+                    result.Response,
+                    loopToolCalls,
+                    trigger,
+                    relayedForEval,
+                    userAskedFor,
+                    externalChangesNeedRequest),
+                cancellationToken);
 
             if (complete)
             {
-                HostDiagnostics.CompletionCheckComplete.Add(1);
+                HostDiagnostics.CompletionCheckComplete.Add(1, triggerTag, askedForTag);
                 logger.LogInformation(
-                    "Completion evaluator: COMPLETE (reprompt {Reprompt}/{Max}) — {Reason}",
-                    reprompt, maxReprompts, reason);
+                    "Completion evaluator: COMPLETE (trigger={Trigger}, userAskedFor={UserAskedFor}, reprompt {Reprompt}/{Max}) — {Reason}",
+                    triggerName, askedForName, reprompt, maxReprompts, reason);
 
                 // Proactive follow-up: only on first-pass completion (reprompt == 0)
                 // of direct user requests (enableFollowUp == true). Subagent results,
@@ -697,10 +891,11 @@ public sealed partial class AgentLoopRunner(
             }
 
             // Not complete — inject continuation and re-enter the loop.
-            HostDiagnostics.CompletionCheckIncomplete.Add(1);
+            // #683: tagged and logged by trigger, so a trigger with a high false-positive rate shows.
+            HostDiagnostics.CompletionCheckIncomplete.Add(1, triggerTag, askedForTag);
             logger.LogInformation(
-                "Completion evaluator: INCOMPLETE (reprompt {Reprompt}/{Max}) — {Reason}",
-                reprompt, maxReprompts, reason);
+                "Completion evaluator: INCOMPLETE (trigger={Trigger}, userAskedFor={UserAskedFor}, reprompt {Reprompt}/{Max}) — {Reason}",
+                triggerName, askedForName, reprompt, maxReprompts, reason);
 
             if (onStageProgress is not null)
                 await onStageProgress("Still working — refining response…", cancellationToken);
@@ -712,15 +907,27 @@ public sealed partial class AgentLoopRunner(
             // has no overlap with "calendar"). Search using the evaluator reason + original
             // request combined, which WILL contain domain terms like "calendar", "email", etc.
             await EnrichContextForRepromptAsync(
-                chatMessages, originalUserRequest, reason ?? string.Empty, cancellationToken);
+                chatMessages, chatOptions, servedUserRequest, reason ?? string.Empty, cancellationToken);
 
-            // Build a targeted continuation nudge.
-            var nudge = CapabilityDenialRegex.IsMatch(result.Response)
-                ? $"Not complete because: {reason}. You DO have access to external services. " +
-                  "Call search_known_services or mcp_list_services to discover available integrations, " +
-                  "then use mcp_invoke_tool to call the appropriate service. Do not give up without trying."
-                : $"Not complete because: {reason}. Continue working on the original request. " +
-                  "Use your available tools — do not claim you lack access without trying them first.";
+            // Build a targeted continuation nudge. #683: it is marked as an internal check and tells
+            // the model to answer the user's original message — unmarked, the model took it for user
+            // feedback ("You're right…") and disowned work its subagent had really done. It stays in
+            // the user role: the history ends on the draft (assistant), and a trailing system
+            // message is hoisted or rejected by some provider paths.
+            // #685: external changes an information-only user message led to anyway.
+            var unrequestedChanges = externalChangesNeedRequest && userAskedFor == UserRequestKind.InformationOnly
+                ? CompletionEvalTriggers.ExternalChanges(loopToolCalls, relayedForEval)
+                : [];
+            var instructions = CapabilityDenialRegex.IsMatch(result.Response)
+                ? "You DO have access to external services. " + HowToReachServices() + " Do not give up without trying."
+                : userAskedFor == UserRequestKind.InformationOnly
+                    ? "Fix what it flagged. Use your tools if you need to check a fact, but do not start work " +
+                      "the user did not ask for." +
+                      CompletionEvalTriggers.RepromptGuidance(trigger, loopToolCalls, userAskedFor, unrequestedChanges)
+                    : "Continue working on the original request. Use your available tools — do not claim you " +
+                      "lack access without trying them first." +
+                      CompletionEvalTriggers.RepromptGuidance(trigger, loopToolCalls, userAskedFor);
+            var nudge = CompletionEvalTriggers.BuildRepromptMessage(reason, instructions, judgedUserRequest);
 
             chatMessages.Add(new ChatMessage(ChatRole.User, nudge));
         }
@@ -770,17 +977,25 @@ public sealed partial class AgentLoopRunner(
         LogContextBreakdown(chatMessages, "native-entry", sessionId, logger, hostOptions.Value.ImageCost);
         RecordLlmCallContextSize(chatMessages, sessionId, hostOptions.Value.ImageCost, logger);
 
+        // A run that escalated mid-turn on an earlier pass (#663) starts this one on the
+        // escalated tier. Within the pass, the function-invoking loop's later iterations are
+        // redirected by TierEscalatingChatClient once the primary-call scope is marked.
+        tier = TierEscalationContext.EffectiveTier(tier);
+
         ChatResponse response;
-        try
+        using (TierEscalationContext.EnterPrimaryCall())
         {
-            response = await llmClient.GetResponseAsync(chatMessages, tier, chatOptions, cancellationToken);
-        }
-        catch (ClientResultException ex)
-            when (ex.Status == 400 && ex.Message.Contains("content_filter", StringComparison.OrdinalIgnoreCase))
-        {
-            LogContentFilterDiagnostics(chatMessages, ex);
-            response = await RecoverFromContentFilterAsync(
-                chatMessages, tier, chatOptions, sessionId, ex, cancellationToken);
+            try
+            {
+                response = await llmClient.GetResponseAsync(chatMessages, tier, chatOptions, cancellationToken);
+            }
+            catch (ClientResultException ex)
+                when (ex.Status == 400 && ex.Message.Contains("content_filter", StringComparison.OrdinalIgnoreCase))
+            {
+                LogContentFilterDiagnostics(chatMessages, ex);
+                response = await RecoverFromContentFilterAsync(
+                    chatMessages, tier, chatOptions, sessionId, ex, cancellationToken);
+            }
         }
 
         // Append response messages to chatMessages so re-prompts have full tool-call history.
@@ -807,6 +1022,8 @@ public sealed partial class AgentLoopRunner(
         if (nativeInputTokens > 0)
         {
             var cachePct = nativeCachedInputTokens * 100.0 / nativeInputTokens;
+            // Summed by the function-invoking loop across all of its iterations: a per-pass total,
+            // not a request size. Per-request sizes are logged as "LLM request:" (#670).
             logger.LogInformation(
                 "Native loop usage: tier={Tier} input={InputTokens} cached={CachedTokens} ({CachePct:F1}%) output={OutputTokens}",
                 tier, nativeInputTokens, nativeCachedInputTokens, cachePct, nativeOutputTokens);
@@ -817,8 +1034,9 @@ public sealed partial class AgentLoopRunner(
         {
             if (!string.IsNullOrWhiteSpace(nativeFinalText))
                 diagNative.LastAssistantText = nativeFinalText;
-            diagNative.InputTokens = nativeInputTokens;
-            diagNative.OutputTokens = nativeOutputTokens;
+            // Accumulate: a re-prompt or follow-up pass is another native loop in the same turn.
+            diagNative.InputTokens += nativeInputTokens;
+            diagNative.OutputTokens += nativeOutputTokens;
             diagNative.ModelId = response.ModelId;
         }
 
@@ -866,7 +1084,44 @@ public sealed partial class AgentLoopRunner(
                 break;
             }
         }
-        chatMessages.Insert(insertAt, new ChatMessage(ChatRole.System, text));
+        chatMessages.Insert(insertAt, new ChatMessage(ChatRole.System, text).Tag(ContextCategory.DateTime));
+    }
+
+    /// <summary>
+    /// Puts the list of deferred tool families (#670) right behind the system prompt, once per
+    /// message list. A no-op when the run defers nothing.
+    /// </summary>
+    internal static void EnsureDeferredToolsOrientation(List<ChatMessage> chatMessages)
+    {
+        if (DeferredToolContext.Orientation() is not { } orientation
+            || chatMessages.Any(m => m.Role == ChatRole.System
+                && (m.Text?.StartsWith(DeferredToolContext.OrientationHeading, StringComparison.Ordinal) ?? false)))
+            return;
+
+        // Same slot as the MCP orientation: right after the system prompt, ahead of everything that
+        // varies by turn. The text lists every deferred family whether loaded or not, so it doesn't
+        // change from turn to turn and the cached prefix holds.
+        var insertAt = chatMessages.Count > 0 && chatMessages[0].Role == ChatRole.System ? 1 : 0;
+        chatMessages.Insert(insertAt, new ChatMessage(ChatRole.System, orientation).Tag(ContextCategory.DeferredTools));
+    }
+
+    /// <summary>
+    /// Puts the MCP orientation for the run's mode (#614) right behind the system prompt. Only
+    /// the run knows its mode — the context is built before the tier picks one — so this is the
+    /// one place every handler's runs get it. Any earlier copy is removed first, so a re-run on the
+    /// same message list, or one in a different mode, leaves exactly one. The text is fixed per
+    /// mode and sits ahead of everything that varies by turn, so the cached prefix holds.
+    /// </summary>
+    internal static void EnsureMcpOrientation(List<ChatMessage> chatMessages, ChatOptions chatOptions)
+    {
+        chatMessages.RemoveAll(m => m.Role == ChatRole.System
+            && m.Text?.StartsWith(TypedToolSurfaceContext.OrientationHeading, StringComparison.Ordinal) == true);
+
+        if (TypedToolSurfaceContext.Orientation(chatOptions) is not { Length: > 0 } orientation)
+            return;
+
+        var insertAt = chatMessages.Count > 0 && chatMessages[0].Role == ChatRole.System ? 1 : 0;
+        chatMessages.Insert(insertAt, new ChatMessage(ChatRole.System, orientation).Tag(ContextCategory.McpOrientation));
     }
 
     /// <summary>
@@ -926,7 +1181,7 @@ public sealed partial class AgentLoopRunner(
             }
         }
 
-        chatMessages.Insert(insertAt, new ChatMessage(ChatRole.System, text));
+        chatMessages.Insert(insertAt, new ChatMessage(ChatRole.System, text).Tag(ContextCategory.Scaffolding));
     }
 
     private const string TaskListMarker = "Current task list:";
@@ -977,7 +1232,7 @@ public sealed partial class AgentLoopRunner(
             sb.AppendLine($"  {item.Id}. [{item.Status}] {item.Description}");
         var text = sb.ToString().TrimEnd();
 
-        var msg = new ChatMessage(ChatRole.System, text);
+        var msg = new ChatMessage(ChatRole.System, text).Tag(ContextCategory.TaskList);
         if (existingIndex >= 0)
         {
             chatMessages[existingIndex] = msg;
@@ -1051,6 +1306,11 @@ public sealed partial class AgentLoopRunner(
                 // results that recorded earlier task_update calls have been trimmed.
                 RefreshTaskListContext(chatMessages, taskList);
 
+                // Typed tools activated by the previous iteration's calls (#612), and deferred
+                // families loaded by them (#670).
+                TypedToolSurfaceContext.AddActivated(chatOptions);
+                DeferredToolContext.AddActivated(chatOptions);
+
                 var stashState = AgentLoopStashContext.Value
                     ?? throw new InvalidOperationException("AgentLoopStashContext was not initialised — RunAsync must set it before invoking the loop.");
 
@@ -1082,6 +1342,10 @@ public sealed partial class AgentLoopRunner(
                 logger.LogInformation("Calling LLM — iteration {Iteration} ({MessageCount} messages in context)",
                     iteration + 2, chatMessages.Count);
                 var sw = Stopwatch.StartNew();
+
+                // Mid-turn escalation (#663): once a tool call in this run escalated it,
+                // every later iteration requests the escalated tier.
+                tier = TierEscalationContext.EffectiveTier(tier);
 
                 try
                 {
@@ -1179,7 +1443,7 @@ public sealed partial class AgentLoopRunner(
                             "Capability denial detected ({Length} chars); nudging LLM to check available services",
                             text.Length);
                         chatMessages.Add(new ChatMessage(ChatRole.Assistant, text));
-                        chatMessages.Add(new ChatMessage(ChatRole.User, CapabilityDenialNudge));
+                        chatMessages.Add(new ChatMessage(ChatRole.User, CapabilityDenialNudge()));
                         continue;
                     }
 
@@ -1198,9 +1462,13 @@ public sealed partial class AgentLoopRunner(
 
                 foreach (var (toolName, argsJson) in textCalls)
                 {
+                    if (toolName == DeferredToolFamilies.LoaderToolName)
+                        DeferredToolContext.Observe(chatOptions, toolName, DeferredToolContext.GuideNameFromJson(argsJson));
                     var tool = chatOptions.Tools?
                         .OfType<AIFunction>()
-                        .FirstOrDefault(t => t.Name.Equals(toolName, StringComparison.OrdinalIgnoreCase));
+                        .FirstOrDefault(t => t.Name.Equals(toolName, StringComparison.OrdinalIgnoreCase))
+                        ?? TypedToolSurfaceContext.TryActivate(chatOptions, toolName)
+                        ?? DeferredToolContext.TryActivate(chatOptions, toolName);
 
                     if (tool is null)
                     {
@@ -1251,10 +1519,22 @@ public sealed partial class AgentLoopRunner(
                         diagTextPre.LastToolStatus = "in-flight";
                     }
 
+                    TierEscalationContext.Value?.ObserveToolCall(toolName, args);
+
                     object? result;
+                    var textOutcome = new ToolCallOutcome(); // #686, see RockBotFunctionInvokingChatClient
+                    // #685: an external change the user did not ask for is refused, not run.
+                    if (ActionGateContext.Check(toolName, argsJson) is { } textRefusal)
+                    {
+                        toolSw.Stop();
+                        result = textRefusal;
+                        textToolStatus = ConsequentialActionGatedStatus;
+                    }
+                    else
                     try
                     {
-                        result = await tool.InvokeAsync(args, cancellationToken);
+                        using (ToolCallOutcomeContext.Set(textOutcome))
+                            result = await tool.InvokeAsync(args, cancellationToken);
                         toolSw.Stop();
                         textToolActivity?.SetTag("rockbot.tool.result_length", result?.ToString()?.Length ?? 0);
                         textToolActivity?.SetStatus(ActivityStatusCode.Ok);
@@ -1281,6 +1561,8 @@ public sealed partial class AgentLoopRunner(
 
                     var textResultStr = result?.ToString() ?? string.Empty;
                     if (IsTimeoutResult(textResultStr)) textToolStatus = ToolError.Codes.Timeout;
+                    TierEscalationContext.Value?.ObserveToolResult(toolName,
+                        textToolStatus != "ok" || RockBotFunctionInvokingChatClient.IsErrorResult(textResultStr));
                     ToolDiagnostics.InvokeDuration.Record(toolSw.Elapsed.TotalMilliseconds,
                         new KeyValuePair<string, object?>("rockbot.tool.name", toolName),
                         new KeyValuePair<string, object?>("rockbot.tool.status", textToolStatus));
@@ -1296,6 +1578,12 @@ public sealed partial class AgentLoopRunner(
                             ? textResultStr[..500] + "…"
                             : textResultStr;
                     }
+                    LoopToolCallLedgerContext.Value?.Record(
+                        toolName, TruncateLedgerArgs(argsJson),
+                        succeeded: textToolStatus == "ok"
+                            && !RockBotFunctionInvokingChatClient.IsErrorResult(textResultStr)
+                            && textOutcome.Succeeded != false,
+                        rawArguments: args, outcome: textOutcome);
 
                     // Chunking is handled by ChunkingAIFunction wrapper on the tool itself.
                     // Per-tool-result cap: text-parsed calls have no callId so the cap falls
@@ -1373,9 +1661,13 @@ public sealed partial class AgentLoopRunner(
                     stashCapture.ArgsSummaries[fc.CallId] = TruncateArgsSummary(argsSummary);
                 }
 
+                if (fc.Name == DeferredToolFamilies.LoaderToolName)
+                    DeferredToolContext.Observe(chatOptions, fc.Name, DeferredToolContext.GuideName(fc.Arguments));
                 var tool = chatOptions.Tools?
                     .OfType<AIFunction>()
-                    .FirstOrDefault(t => t.Name.Equals(fc.Name, StringComparison.OrdinalIgnoreCase));
+                    .FirstOrDefault(t => t.Name.Equals(fc.Name, StringComparison.OrdinalIgnoreCase))
+                    ?? TypedToolSurfaceContext.TryActivate(chatOptions, fc.Name)
+                    ?? DeferredToolContext.TryActivate(chatOptions, fc.Name);
 
                 if (tool is null)
                 {
@@ -1396,10 +1688,21 @@ public sealed partial class AgentLoopRunner(
                 toolActivity?.SetTag("rockbot.tool.name", fc.Name);
                 var toolSw = Stopwatch.StartNew();
                 var toolStatus = "ok";
+                TierEscalationContext.Value?.ObserveToolCall(fc.Name, fc.Arguments);
                 object? result;
+                var nativeOutcome = new ToolCallOutcome(); // #686, see RockBotFunctionInvokingChatClient
+                // #685: an external change the user did not ask for is refused, not run.
+                if (ActionGateContext.Check(fc.Name, argsSummary) is { } refusal)
+                {
+                    toolSw.Stop();
+                    result = refusal;
+                    toolStatus = ConsequentialActionGatedStatus;
+                }
+                else
                 try
                 {
-                    result = await tool.InvokeAsync(args, cancellationToken);
+                    using (ToolCallOutcomeContext.Set(nativeOutcome))
+                        result = await tool.InvokeAsync(args, cancellationToken);
                     toolSw.Stop();
                     toolActivity?.SetTag("rockbot.tool.result_length", result?.ToString()?.Length ?? 0);
                     toolActivity?.SetStatus(ActivityStatusCode.Ok);
@@ -1427,12 +1730,20 @@ public sealed partial class AgentLoopRunner(
                 // Chunking is handled by ChunkingAIFunction wrapper on the tool itself.
                 var nativeResultStr = result?.ToString() ?? string.Empty;
                 if (IsTimeoutResult(nativeResultStr)) toolStatus = ToolError.Codes.Timeout;
+                TierEscalationContext.Value?.ObserveToolResult(fc.Name,
+                    toolStatus != "ok" || RockBotFunctionInvokingChatClient.IsErrorResult(nativeResultStr));
                 ToolDiagnostics.InvokeDuration.Record(toolSw.Elapsed.TotalMilliseconds,
                     new KeyValuePair<string, object?>("rockbot.tool.name", fc.Name),
                     new KeyValuePair<string, object?>("rockbot.tool.status", toolStatus));
                 ToolDiagnostics.Invocations.Add(1,
                     new KeyValuePair<string, object?>("rockbot.tool.name", fc.Name),
                     new KeyValuePair<string, object?>("rockbot.tool.status", toolStatus));
+                LoopToolCallLedgerContext.Value?.Record(
+                    fc.Name, TruncateLedgerArgs(argsSummary),
+                    succeeded: toolStatus == "ok"
+                        && !RockBotFunctionInvokingChatClient.IsErrorResult(nativeResultStr)
+                        && nativeOutcome.Succeeded != false,
+                    rawArguments: fc.Arguments, outcome: nativeOutcome);
 
                 // Per-tool-result cap (text-loop native path). Same intent as the cap
                 // applied by RockBotFunctionInvokingChatClient on the FICC path: stash
@@ -1523,6 +1834,7 @@ public sealed partial class AgentLoopRunner(
                 "Report only what was completed — do not describe intentions or future actions.")
         };
 
+        tier = TierEscalationContext.EffectiveTier(tier);
         var finalResponse = await llmClient.GetResponseAsync(
             summaryMessages, tier, new ChatOptions(), cancellationToken);
         var forcedText = ExtractAssistantText(finalResponse);
@@ -1573,8 +1885,8 @@ public sealed partial class AgentLoopRunner(
             HostDiagnostics.TurnToolCalls.Record(totalToolCalls, tierTag);
             if (LoopDiagnosticsContext.Value is { } diagTextFinal)
             {
-                diagTextFinal.InputTokens = totalInputTokens;
-                diagTextFinal.OutputTokens = totalOutputTokens;
+                diagTextFinal.InputTokens += totalInputTokens;
+                diagTextFinal.OutputTokens += totalOutputTokens;
                 diagTextFinal.ModelId ??= lastModelId;
             }
         }
@@ -1634,6 +1946,12 @@ public sealed partial class AgentLoopRunner(
     private const string SkillBodyMessagePrefix = "Skill: ";
 
     /// <summary>
+    /// The same push as framed by <see cref="SkillRecallFraming.Wrap"/>: preamble, blank line,
+    /// then the "Skill: " line.
+    /// </summary>
+    private const string FramedSkillBodyPrefix = SkillRecallFraming.Preamble + "\n\n" + SkillBodyMessagePrefix;
+
+    /// <summary>
     /// Tool name (case-insensitive) the model calls to (re-)fetch a skill body. A call
     /// to this tool refreshes the named skill's last-use counter, keeping the body
     /// resident even if it's already past the unload threshold.
@@ -1652,10 +1970,19 @@ public sealed partial class AgentLoopRunner(
         if (message.Role != ChatRole.System) return false;
 
         var text = message.Text;
-        if (text is null || text.Length <= SkillBodyMessagePrefix.Length) return false;
-        if (!text.StartsWith(SkillBodyMessagePrefix, StringComparison.Ordinal)) return false;
+        if (text is null) return false;
 
-        var nameStart = SkillBodyMessagePrefix.Length;
+        // SkillRecallFraming.Wrap puts its #492 preamble ahead of the "Skill: " line (#670:
+        // matching only the bare prefix left every recalled body resident for the whole run).
+        int nameStart;
+        if (text.StartsWith(SkillBodyMessagePrefix, StringComparison.Ordinal))
+            nameStart = SkillBodyMessagePrefix.Length;
+        else if (text.StartsWith(FramedSkillBodyPrefix, StringComparison.Ordinal))
+            nameStart = FramedSkillBodyPrefix.Length;
+        else
+            return false;
+        if (text.Length <= nameStart) return false;
+
         var newlineIdx = text.IndexOf('\n', nameStart);
         if (newlineIdx <= nameStart) return false;
 
@@ -1798,6 +2125,12 @@ public sealed partial class AgentLoopRunner(
         if (StashExemptTools.Contains(toolName))
             return resultStr;
 
+        // file_read pages its own output on whole-line boundaries and names the next offset
+        // in a footer. A head+tail stitch would hide that footer and hand the model a partial
+        // file it may then "restore" with file_write (issue #664). See SelfPagingTools.
+        if (SelfPagingTools.Contains(toolName))
+            return resultStr;
+
         // No callId or no stash state → head-only truncation. The model can't recover
         // the elided content (nothing to register), so we don't promise it can.
         if (string.IsNullOrEmpty(callId) || stashState is null)
@@ -1903,7 +2236,7 @@ public sealed partial class AgentLoopRunner(
         }
         var text = sb.ToString().TrimEnd();
 
-        var msg = new ChatMessage(ChatRole.System, text);
+        var msg = new ChatMessage(ChatRole.System, text).Tag(ContextCategory.StashRegistry);
         if (existingIndex >= 0)
         {
             chatMessages[existingIndex] = msg;
@@ -1921,6 +2254,14 @@ public sealed partial class AgentLoopRunner(
         }
         chatMessages.Insert(insertAt, msg);
     }
+
+    /// <summary>
+    /// Shortens a call's arguments for <see cref="LoopToolCallLedger"/>. The ledger only needs the
+    /// leading arguments — enough to read <c>mcp_invoke_tool</c>'s <c>tool_name</c> — not a
+    /// <c>file_write</c>'s whole body.
+    /// </summary>
+    internal static string? TruncateLedgerArgs(string? args) =>
+        args is { Length: > 300 } ? args[..300] : args;
 
     /// <summary>
     /// Truncates a long args summary so registry entries stay compact in the system
@@ -2133,11 +2474,10 @@ public sealed partial class AgentLoopRunner(
     }
 
     /// <summary>
-    /// Temporary diagnostic (issue: context-bloat investigation) — emits a per-LLM-call
-    /// breakdown of the current message list for scheduled-task sessions only. Categorises
-    /// by role, lists the top-15 largest messages with a short preview, and reports
-    /// estimated tokens. Gated on <paramref name="sessionId"/> starting with <c>patrol/</c>
-    /// so user-session logs are unaffected. Remove after the bloat root cause is identified.
+    /// Debug-level breakdown of the message list at a loop boundary: by role, plus the
+    /// top-15 largest messages with a short preview and estimated tokens. The Information-level
+    /// per-request view, with provider token counts and context categories, is
+    /// <see cref="RequestAccountingChatClient"/>'s "LLM request:" line (#670).
     /// </summary>
     internal static void LogContextBreakdown(
         IList<ChatMessage> messages,
@@ -2146,12 +2486,7 @@ public sealed partial class AgentLoopRunner(
         ILogger logger,
         ImageCostOptions? imageCost = null)
     {
-        if (sessionId is null
-            || !(sessionId.StartsWith("patrol/", StringComparison.Ordinal)
-                 || sessionId.StartsWith("subagent-", StringComparison.Ordinal)
-                 || sessionId.StartsWith("worker-", StringComparison.Ordinal)))
-            return;
-        if (!logger.IsEnabled(LogLevel.Information))
+        if (!logger.IsEnabled(LogLevel.Debug))
             return;
 
         var totalChars = 0;
@@ -2186,13 +2521,13 @@ public sealed partial class AgentLoopRunner(
             entries.Add((i, role, chars, preview));
         }
 
-        logger.LogInformation(
+        logger.LogDebug(
             "ContextBreakdown[{Label}] session={Session} msgs={Count} chars={Chars:N0} ~tokens={Tokens:N0}",
             label, sessionId, messages.Count, totalChars, totalChars / 4);
 
         foreach (var kv in byRole.OrderByDescending(static kv => kv.Value.Chars))
         {
-            logger.LogInformation(
+            logger.LogDebug(
                 "  ByRole {Role,-10} {Count,3} msgs  {Chars,9:N0} chars  ~{Tokens,7:N0} tok  ({Pct,5:F1}%)",
                 kv.Key, kv.Value.Count, kv.Value.Chars, kv.Value.Chars / 4,
                 totalChars > 0 ? 100.0 * kv.Value.Chars / totalChars : 0);
@@ -2200,16 +2535,15 @@ public sealed partial class AgentLoopRunner(
 
         foreach (var e in entries.OrderByDescending(static x => x.Chars).Take(15))
         {
-            logger.LogInformation(
+            logger.LogDebug(
                 "  Msg[{Idx,3}] {Role,-10} {Chars,8:N0} chars  {Preview}",
                 e.Idx, e.Role, e.Chars, e.Preview);
         }
     }
 
     /// <summary>
-    /// Temporary diagnostic — compact one-line size summary for use inside tight loops
-    /// where the full breakdown would be too verbose (e.g. between tool invocations
-    /// inside the native FICC loop). Gated like <see cref="LogContextBreakdown"/>.
+    /// Debug-level one-line size summary for use inside tight loops where the full breakdown
+    /// would be too verbose (e.g. between tool invocations inside the native FICC loop).
     /// </summary>
     internal static void LogContextSize(
         IList<ChatMessage> messages,
@@ -2218,16 +2552,11 @@ public sealed partial class AgentLoopRunner(
         ILogger logger,
         ImageCostOptions? imageCost = null)
     {
-        if (sessionId is null
-            || !(sessionId.StartsWith("patrol/", StringComparison.Ordinal)
-                 || sessionId.StartsWith("subagent-", StringComparison.Ordinal)
-                 || sessionId.StartsWith("worker-", StringComparison.Ordinal)))
-            return;
-        if (!logger.IsEnabled(LogLevel.Information))
+        if (!logger.IsEnabled(LogLevel.Debug))
             return;
 
         var totalChars = messages.Sum(m => EstimateMessageChars(m, imageCost, logger));
-        logger.LogInformation(
+        logger.LogDebug(
             "ContextSize[{Label}] session={Session} msgs={Count} chars={Chars:N0} ~tokens={Tokens:N0}",
             label, sessionId, messages.Count, totalChars, totalChars / 4);
     }
@@ -2739,7 +3068,7 @@ public sealed partial class AgentLoopRunner(
         // Enrich context with skills/services relevant to the follow-up.
         var searchTerms = followUp.SearchTerms ?? followUp.Prompt;
         await EnrichContextForRepromptAsync(
-            chatMessages, originalUserRequest, searchTerms, cancellationToken);
+            chatMessages, chatOptions, originalUserRequest, searchTerms, cancellationToken);
 
         // Inject the completed response and the follow-up instruction.
         chatMessages.Add(new ChatMessage(ChatRole.Assistant, completedResponse));
@@ -2947,39 +3276,25 @@ public sealed partial class AgentLoopRunner(
     /// on any error so it never blocks the response pipeline.
     /// </summary>
     private async Task<(bool Complete, string? Reason)> EvaluateCompletionAsync(
-        string originalUserRequest, string agentResponse, CancellationToken cancellationToken)
+        CompletionEvalTriggers.EvaluatorInput input, CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(originalUserRequest) || string.IsNullOrWhiteSpace(agentResponse))
+        if ((input.RecentUserMessages.Count == 0 && string.IsNullOrWhiteSpace(input.OriginatingUserRequest))
+            || string.IsNullOrWhiteSpace(input.AgentResponse))
             return (true, "empty request or response");
 
         try
         {
-            var messages = new List<ChatMessage>
-            {
-                new(ChatRole.System, CompletionEvaluatorPrompt),
-                new(ChatRole.User,
-                    $"## Original user request\n{originalUserRequest}\n\n## Agent response\n{agentResponse}")
-            };
+            var messages = BuildCompletionEvaluatorMessages(input);
 
             var response = await llmClient.GetResponseAsync(
                 messages, ModelTier.Low, new ChatOptions(), cancellationToken);
-            var raw = response.Text?.Trim() ?? string.Empty;
-            var json = ExtractJsonObject(raw);
-
-            if (string.IsNullOrEmpty(json))
+            if (ParseCompletionVerdict(response.Text) is not { } verdict)
             {
-                logger.LogWarning("Completion evaluator: no parseable JSON in response; defaulting to complete");
-                return (true, "evaluator returned no JSON");
+                logger.LogWarning("Completion evaluator: no parseable JSON verdict in response; defaulting to complete");
+                return (true, "evaluator returned no usable JSON");
             }
 
-            var dto = JsonSerializer.Deserialize<CompletionEvalDto>(json, s_evalJsonOptions);
-            if (dto is null)
-            {
-                logger.LogWarning("Completion evaluator: failed to deserialize JSON; defaulting to complete");
-                return (true, "evaluator JSON deserialization failed");
-            }
-
-            return (dto.Complete, dto.Reason);
+            return verdict;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -2988,10 +3303,156 @@ public sealed partial class AgentLoopRunner(
         }
     }
 
+    /// <summary>
+    /// The completion evaluator's request: the request-versus-result rubric as the system message,
+    /// and the user's recent messages, the tool-call list and the reply as the user message (#666).
+    /// Internal so tests can assert on what the evaluator reads.
+    /// </summary>
+    internal static List<ChatMessage> BuildCompletionEvaluatorMessages(CompletionEvalTriggers.EvaluatorInput input) =>
+    [
+        new(ChatRole.System, CompletionEvaluatorPrompt),
+        new(ChatRole.User, CompletionEvalTriggers.BuildEvaluatorUserMessage(input)),
+    ];
+
+    /// <summary>
+    /// Parses the evaluator's raw output into a verdict. Tolerates <c>&lt;think&gt;</c> preambles,
+    /// code fences and prose around the JSON; returns null when no usable verdict is present so the
+    /// caller can fail open. Internal for tests.
+    /// </summary>
+    internal static (bool Complete, string? Reason)? ParseCompletionVerdict(string? raw)
+    {
+        var json = ExtractJsonObject(raw?.Trim() ?? string.Empty);
+        if (string.IsNullOrEmpty(json))
+            return null;
+
+        try
+        {
+            var dto = JsonSerializer.Deserialize<CompletionEvalDto>(json, s_evalJsonOptions);
+            return dto is null ? null : (dto.Complete, dto.Reason);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The last <paramref name="count"/> user-role messages with text, oldest first — what the user
+    /// has been asking for over the last few turns, so the evaluator sees constraints given before
+    /// the latest message (#666).
+    /// </summary>
+    internal static IReadOnlyList<string> ExtractRecentUserMessages(List<ChatMessage> chatMessages, int count)
+    {
+        var found = new List<string>(count);
+        for (var i = chatMessages.Count - 1; i >= 0 && found.Count < count; i--)
+        {
+            if (chatMessages[i].Role == ChatRole.User && !string.IsNullOrWhiteSpace(chatMessages[i].Text))
+                found.Add(chatMessages[i].Text!);
+        }
+        found.Reverse();
+        return found;
+    }
+
+    /// <summary>
+    /// The agent's last message before the latest user message, so the evaluator can resolve
+    /// "do it" or "that" against what the agent had proposed. Null when there is none.
+    /// </summary>
+    /// <summary>
+    /// The consequential-action scope a run uses (#685): the caller's, else the enclosing run's,
+    /// else <see cref="ActionGateScope.Unknown"/>. A scope that needs a user instruction but carries
+    /// no classification takes <paramref name="classified"/> — the run's own judged user request.
+    /// </summary>
+    internal static ActionGateScope ResolveActionGateScope(
+        ActionGateScope? requested, ActionGateScope? enclosing, UserRequestKind classified)
+    {
+        var scope = requested ?? enclosing ?? ActionGateScope.Unknown;
+        return scope.RequiresUserInstruction && scope.UserAskedFor is null
+            ? scope with { UserAskedFor = classified }
+            : scope;
+    }
+
+    internal static string? ExtractPreviousAgentMessage(List<ChatMessage> chatMessages)
+    {
+        var i = chatMessages.Count - 1;
+        while (i >= 0 && !(chatMessages[i].Role == ChatRole.User && !string.IsNullOrWhiteSpace(chatMessages[i].Text)))
+            i--;
+        for (i--; i >= 0; i--)
+        {
+            if (chatMessages[i].Role == ChatRole.User && !string.IsNullOrWhiteSpace(chatMessages[i].Text))
+                return null; // two user messages in a row: no agent message between them
+            if (chatMessages[i].Role == ChatRole.Assistant && !string.IsNullOrWhiteSpace(chatMessages[i].Text))
+                return chatMessages[i].Text;
+        }
+        return null;
+    }
+
     private static readonly JsonSerializerOptions s_evalJsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
     };
+
+    /// <summary>
+    /// Fits <paramref name="chatOptions"/> to the typed-tool mode of <paramref name="tier"/> (#613)
+    /// and adds the typed tools this session activated on earlier turns (#612). <see cref="RunAsync"/>
+    /// does this itself; call it only before an LLM request made outside the loop, such as a
+    /// pre-fetched first response.
+    /// </summary>
+    public void AddSessionTools(ChatOptions chatOptions, ModelTier tier)
+    {
+        using var _ = TypedToolSurfaceContext.Set(typedToolSurface, tier);
+        TypedToolSurfaceContext.Shape(chatOptions);
+        TypedToolSurfaceContext.AddActivated(chatOptions);
+    }
+
+    /// <summary>
+    /// How the model reaches an external service, worded for the run's typed-tool mode (#612,
+    /// #613): by typed <c>{server}__{tool}</c> name when wrappers are on, through
+    /// <c>mcp_invoke_tool</c> when they're off.
+    /// </summary>
+    private string HowToReachServices() => (TypedToolSurfaceContext.Mode ?? TypedToolMode.Off) switch
+    {
+        TypedToolMode.Lazy or TypedToolMode.Pinned =>
+            $"Call {typedToolSurface!.LoaderToolName} with a few keywords for what you need; the tools it returns " +
+            "become callable by their typed names ({server}__{tool}). search_known_services and " +
+            "mcp_list_services list whole services.",
+        TypedToolMode.Eager =>
+            "Call search_known_services or mcp_list_services to discover available integrations, " +
+            "then call the service's typed tool ({server}__{tool}) directly.",
+        _ =>
+            "Call search_known_services or mcp_list_services to discover available integrations, " +
+            "then use mcp_invoke_tool to call the appropriate service."
+    };
+
+    /// <summary>
+    /// One MCP server's lines in the re-prompt's service hints. With typed tools on, the
+    /// candidate's top items are typed names (see <c>ServiceSearchIndex</c>) and the hint says to
+    /// call them; in lazy mode they're activated first, so the names it gives are callable.
+    /// </summary>
+    private void AppendMcpServiceHint(StringBuilder sb, ServiceSearchCandidate candidate, ChatOptions chatOptions)
+    {
+        var mode = TypedToolSurfaceContext.Mode ?? TypedToolMode.Off;
+        var activating = mode is TypedToolMode.Lazy or TypedToolMode.Pinned;
+        if (mode == TypedToolMode.Off || !candidate.TopItemsAreTypedTools)
+        {
+            sb.AppendLine($"  Sample tools: {string.Join(", ", candidate.TopItems)}");
+            sb.AppendLine($"  Before calling one, get the server's tool names and schemas with " +
+                $"mcp_get_service_details(server_name=\"{candidate.Id}\").");
+            return;
+        }
+
+        if (activating)
+        {
+            var present = (chatOptions.Tools ?? []).Select(t => t.Name).ToHashSet(StringComparer.Ordinal);
+            foreach (var name in candidate.TopItems.Where(n => !present.Contains(n)))
+                TypedToolSurfaceContext.TryActivate(chatOptions, name);
+        }
+
+        sb.AppendLine($"  Typed tools: {string.Join(", ", candidate.TopItems)} — call them directly.");
+        sb.AppendLine(activating
+            ? $"  For another tool on this server, call {typedToolSurface!.LoaderToolName} " +
+              $"or mcp_get_service_details(server_name=\"{candidate.Id}\")."
+            : $"  For the rest of this server's tools, call mcp_get_service_details(server_name=\"{candidate.Id}\").");
+    }
 
     /// <summary>
     /// On re-prompt, searches for skills and services using the evaluator reason combined
@@ -3001,6 +3462,7 @@ public sealed partial class AgentLoopRunner(
     /// </summary>
     private async Task EnrichContextForRepromptAsync(
         List<ChatMessage> chatMessages,
+        ChatOptions chatOptions,
         string originalUserRequest,
         string evaluatorReason,
         CancellationToken ct)
@@ -3012,16 +3474,29 @@ public sealed partial class AgentLoopRunner(
         // Search for relevant skills
         try
         {
-            var skills = await skillStore.SearchAsync(enrichedQuery, maxResults: 3, ct);
+            // #670: skip skills whose body is already in context; inject the best new one in full,
+            // framed like the turn-start recall so skill-body aging can unload it, and name the rest.
+            var loaded = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var m in chatMessages)
+            {
+                if (TryExtractLoadedSkillName(m, out var loadedName))
+                    loaded.Add(loadedName);
+            }
+            var skills = (await skillStore.SearchAsync(enrichedQuery, maxResults: 3, ct))
+                .Where(s => !loaded.Contains(s.Name))
+                .ToList();
             if (skills.Count > 0)
             {
-                var sb = new StringBuilder("Relevant skills for this task:\n");
-                foreach (var skill in skills)
+                chatMessages.Add(new ChatMessage(ChatRole.System, SkillRecallFraming.Wrap(skills[0]))
+                    .Tag(ContextCategory.SkillBody));
+                if (skills.Count > 1)
                 {
-                    sb.AppendLine($"\n## Skill: {skill.Name}");
-                    sb.AppendLine(skill.Content);
+                    var others = skills.Skip(1).Select(s =>
+                        $"- {s.Name}: {(string.IsNullOrWhiteSpace(s.Summary) ? "(summary pending)" : s.Summary)}");
+                    chatMessages.Add(new ChatMessage(ChatRole.System,
+                        "Other skills that may help with this task — call get_skill for one that fits:\n" +
+                        string.Join("\n", others)).Tag(ContextCategory.SkillSummaries));
                 }
-                chatMessages.Add(new ChatMessage(ChatRole.System, sb.ToString()));
                 logger.LogInformation(
                     "Completion re-prompt: injected {Count} skill(s) via enriched search: {Skills}",
                     skills.Count, string.Join(", ", skills.Select(s => s.Name)));
@@ -3047,17 +3522,13 @@ public sealed partial class AgentLoopRunner(
                     {
                         sb.AppendLine($"\n### {c.Id} ({c.Type}): {c.Summary}");
                         if (c.Type == "mcp")
-                        {
-                            sb.AppendLine($"  Sample tools: {string.Join(", ", c.TopItems)}");
-                            sb.AppendLine($"  IMPORTANT: Call mcp_get_service_details(server_name=\"{c.Id}\") " +
-                                "to see ALL available tools before invoking. Do NOT guess tool names.");
-                        }
+                            AppendMcpServiceHint(sb, c, chatOptions);
                         else if (c.TopItems.Count > 0)
                         {
                             sb.AppendLine($"  Top skills: {string.Join(", ", c.TopItems)}");
                         }
                     }
-                    chatMessages.Add(new ChatMessage(ChatRole.System, sb.ToString()));
+                    chatMessages.Add(new ChatMessage(ChatRole.System, sb.ToString()).Tag(ContextCategory.ServiceHints));
                     logger.LogInformation(
                         "Completion re-prompt: injected {Count} service hint(s) via enriched search: {Services}",
                         candidates.Count, string.Join(", ", candidates.Select(c => c.Id)));

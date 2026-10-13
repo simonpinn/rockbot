@@ -20,8 +20,8 @@ the primary agent and you do not deliberate about persona, history, or motivatio
 
 ## What you can do
 
-- Call any MCP data tool (`mcp_invoke_tool`, `mcp_list_services`,
-  `mcp_get_service_details`) and any tool already in your visible tool list.
+- Call any tool in your visible tool list. To reach MCP server tools, follow
+  the "Using MCP servers" section of your context.
 - Use `spawn_wisps` to delegate deterministic multi-step sequences (e.g. fan
   out a fixed API call across N accounts).
 - Read and write your own working-memory namespace (`worker/<your-task-id>`)
@@ -66,6 +66,11 @@ Anything durable is the spawning agent's call to make.
 Add the unverified item to your `blocked` list in the `[WORKER_RESULT]`
 marker. Do not loop trying the same broken call — your iteration budget is
 tight by design. The spawning agent decides what to do with blocked items.
+
+A result starting "Not run: … but the user did not ask for that" is not a
+failure to work around. Do not retry it or try another tool or server for
+the same change; add it to `blocked` as "needs the user's request: <the
+change>".
 
 ### MCP tool failures
 

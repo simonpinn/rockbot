@@ -10,6 +10,24 @@ namespace RockBot.Agent.McpBridge;
 public sealed class McpBridgeServerConfig
 {
     /// <summary>
+    /// Stable id of this entry (<see cref="RockBot.Tools.Mcp.McpServerNames.NewId"/>). The bridge
+    /// assigns one to any entry without it on load and persists it. It survives restarts and
+    /// reconnects, but not a rename: consumers that must follow a server across renames store the
+    /// id next to the name and re-resolve.
+    /// </summary>
+    public string? Id { get; set; }
+
+    /// <summary>
+    /// Who created this entry. <see cref="AgentOrigin"/> marks one the agent added with
+    /// <c>mcp_register_server</c>; anything else, including no value, is the operator's (#603).
+    /// Only the bridge sets it — the register request has no such field.
+    /// </summary>
+    public string? Origin { get; set; }
+
+    /// <summary>The <see cref="Origin"/> of an entry created by <c>mcp_register_server</c>.</summary>
+    public const string AgentOrigin = "agent";
+
+    /// <summary>
     /// Transport type: "sse" (only SSE is supported in this embedded mode).
     /// </summary>
     public string? Type { get; set; }
@@ -98,56 +116,32 @@ public sealed class McpBridgeServerConfig
     public McpServerAuthConfig? Auth { get; set; }
 
     /// <summary>
-    /// Copies the operator-only policy that <c>register_mcp_server</c> cannot express from the
-    /// config this one replaces.
+    /// True when the agent may unregister this entry: it created the entry with
+    /// <c>mcp_register_server</c>, and the entry carries nothing that tool can't express (#603).
     /// </summary>
     /// <remarks>
-    /// <para>
-    /// <c>register_mcp_server</c> is LLM-callable. Re-registering an existing name must not let
-    /// the model shed policy the operator declared — dropping <see cref="Elicitation"/> would
-    /// fall back to <c>DefaultElicitation</c>, turning an <c>off</c> server into an answering
-    /// one and discarding its <c>deniedFields</c>.
-    /// </para>
-    /// <para>
-    /// Restrictions and grants are carried differently. Restrictions (<see cref="ArgGuards"/>,
-    /// the elicitation mode, <c>deniedFields</c>, <c>maxPerCall</c>) always carry over. Grants —
-    /// an elicitation <c>responder</c> that may hand over conversation data, and <c>defaults</c>,
-    /// which answer on the user's behalf and can pre-answer confirmations — belong to the server
-    /// the operator configured, so they carry over only when the re-registration still points at
-    /// that server (same <see cref="EndpointIdentity"/>). Otherwise the model could re-point a
-    /// trusted name at a URL of its choosing and inherit what the operator granted.
-    /// </para>
+    /// <c>mcp_register_server</c> and <c>mcp_unregister_server</c> are LLM-callable, and the
+    /// bridge persists what they do to <c>mcp.json</c>. Every other entry is the operator's: one
+    /// seeded from <c>McpBridge:DefaultServers</c>, written into <c>mcp.json</c> by hand, or
+    /// created by the agent and since given policy by the operator — tool filters, headers, auth,
+    /// guards, elicitation, attachments, a timeout or a transport mode. The model must not be
+    /// able to shed any of that by unregistering and registering again, so it can't touch such an
+    /// entry at all. The operator changes those entries through configuration.
     /// </remarks>
-    public void CarryOperatorPolicyFrom(McpBridgeServerConfig? existing)
-    {
-        if (existing is null) return;
-        ArgGuards = existing.ArgGuards;
+    public bool IsAgentOwned() =>
+        string.Equals(Origin, AgentOrigin, StringComparison.OrdinalIgnoreCase) && !HasOperatorPolicy();
 
-        var sameServer = string.Equals(EndpointIdentity(), existing.EndpointIdentity(), StringComparison.Ordinal);
-        Elicitation = sameServer ? existing.Elicitation : existing.Elicitation?.WithoutGrants();
-    }
-
-    /// <summary>
-    /// Which server this config talks to — transport type, URL, or command, arguments and
-    /// environment — and nothing about how it is talked to.
-    /// </summary>
-    /// <remarks>
-    /// Unlike <see cref="CanonicalIdentity"/>, this leaves out tool filters, headers, auth profile
-    /// and transport mode. <c>register_mcp_server</c> cannot express any of those, so including
-    /// them would make every filtered or authenticated server look like a different server when
-    /// the model re-registers it at the same address.
-    /// </remarks>
-    public string EndpointIdentity()
-    {
-        var type = Type?.Trim().ToLowerInvariant() ?? string.Empty;
-        var url = NormalizeUrl(Url);
-        var command = Command?.Trim() ?? string.Empty;
-        var args = string.Join("\u001f", Args ?? []);
-        var env = string.Join("\u001f", (Env ?? [])
-            .OrderBy(kvp => kvp.Key, StringComparer.Ordinal)
-            .Select(kvp => $"{kvp.Key}={kvp.Value}"));
-        return string.Join("\u001e", type, url, command, args, env);
-    }
+    /// <summary>True when this entry sets anything <c>mcp_register_server</c> can't.</summary>
+    public bool HasOperatorPolicy() =>
+        AllowedTools is { Count: > 0 }
+        || DeniedTools is { Count: > 0 }
+        || Headers is { Count: > 0 }
+        || Auth is not null
+        || ArgGuards is { Count: > 0 }
+        || Elicitation is not null
+        || Attachments is not null
+        || ToolTimeoutMs is not null
+        || !string.Equals(TransportMode?.Trim() ?? "auto", "auto", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Whether this config uses HTTP-based transport (SSE or streamable HTTP).
@@ -180,6 +174,15 @@ public sealed class McpBridgeServerConfig
         var authProfile = Auth?.Profile?.Trim().ToLowerInvariant() ?? string.Empty;
         return string.Join("", type, url, transportMode, command, args, env, headers, allowedTools, deniedTools, authProfile);
     }
+
+    /// <summary>
+    /// First 16 hex characters of the SHA-256 of <see cref="CanonicalIdentity"/>. This is what goes
+    /// on the bus (<c>McpServerSummary.IdentityHash</c>) so the agent can recognise a renamed
+    /// server; the identity itself includes env vars and headers, which can carry secrets.
+    /// </summary>
+    public string IdentityHash() =>
+        Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(CanonicalIdentity())))[..16];
 
     /// <summary>
     /// Normalizes a URL for duplicate detection: lowercases the scheme and authority,

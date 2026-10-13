@@ -31,6 +31,14 @@ public sealed class ChunkingAIFunction(
     public override string Description => inner.Description;
     public override JsonElement JsonSchema => inner.JsonSchema;
 
+    /// <summary>Looks through the decorator, so a caller can find what the inner function is.</summary>
+    public override object? GetService(Type serviceType, object? serviceKey = null) =>
+        base.GetService(serviceType, serviceKey) ?? inner.GetService(serviceType, serviceKey);
+
+    /// <summary>The same chunking, applied to another function.</summary>
+    public ChunkingAIFunction WithInner(AIFunction function) =>
+        new(function, workingMemory, @namespace, chunkingThreshold, logger);
+
     protected override async ValueTask<object?> InvokeCoreAsync(
         AIFunctionArguments arguments,
         CancellationToken cancellationToken)
@@ -38,7 +46,7 @@ public sealed class ChunkingAIFunction(
         var result = await inner.InvokeAsync(arguments, cancellationToken);
         var resultStr = result?.ToString() ?? string.Empty;
 
-        if (StashExemptTools.Contains(inner.Name))
+        if (StashExemptTools.Contains(inner.Name) || SelfPagingTools.Contains(inner.Name))
             return result;
 
         if (resultStr.Length <= chunkingThreshold)

@@ -37,8 +37,26 @@ internal sealed class SubagentRunner(
     IOptions<WorkingMemoryOptions> workingMemoryOptions,
     ILogger<SubagentRunner> logger,
     ISkillResourceUsageStore? skillResourceUsageStore = null,
-    ISessionA2AAwaiter? a2aAwaiter = null)
+    ISessionA2AAwaiter? a2aAwaiter = null,
+    IMcpSkillSurface? mcpSkillSurface = null,
+    IMcpToolDirectory? mcpToolDirectory = null,
+    IEnumerable<ISessionEndListener>? sessionEndListeners = null,
+    ISessionWorkRegistry? sessionWorkRegistry = null,
+    IOptions<SubagentOptions>? subagentOptions = null)
 {
+    /// <summary>
+    /// The completion-evaluator triggers a subagent's own loop runs on (#686): claims of work it
+    /// must back with tool calls before the result is relayed. The other triggers stay off, so an
+    /// unfinished-looking subagent is not pushed to do work its task did not include.
+    /// </summary>
+    internal static readonly IReadOnlySet<CompletionEvalTrigger> SelfCheckTriggers =
+        new HashSet<CompletionEvalTrigger>
+        {
+            CompletionEvalTrigger.SideEffect,
+            CompletionEvalTrigger.BareClaim,
+            CompletionEvalTrigger.ClaimedChange,
+        };
+
     public async Task RunAsync(
         string taskId,
         string subagentSessionId,
@@ -49,7 +67,15 @@ internal sealed class SubagentRunner(
         bool consolidate,
         int? maxIterations,
         TimeSpan timeout,
-        CancellationToken ct)
+        CancellationToken ct,
+        // #666: the user message that led to the spawn; passed through to the result so the
+        // primary's synthesis turn is checked against it.
+        string? originatingUserRequest = null,
+        // #665: spawn_subagent inputs, resolved at spawn; inlined ahead of other prior work.
+        IReadOnlyList<SubagentInput>? inputs = null,
+        // #685: the consequential-action scope captured at spawn (already marked as a subagent's).
+        // Null leaves RunAsync to inherit whatever scope flows in, or none.
+        ActionGateScope? actionGate = null)
     {
         var classification = tierSelector.Classify(description, new TierRoutingContext(Origin: "subagent"));
         var tier = classification.Tier;
@@ -122,6 +148,18 @@ internal sealed class SubagentRunner(
         if (!string.IsNullOrEmpty(context))
             chatMessages.Add(new ChatMessage(ChatRole.System, $"Context: {context}"));
 
+        // #665: what earlier subagents in this conversation produced, the files it wrote, the user's
+        // request, and the inputs the primary named — so this task builds on prior research even
+        // when the primary did not pass it along.
+        var lineage = BuildLineage(description, context, primarySessionId, originatingUserRequest, inputs);
+        if (lineage is not null)
+        {
+            chatMessages.Add(new ChatMessage(ChatRole.System, lineage).Tag(ContextCategory.Lineage));
+            logger.LogInformation(
+                "Subagent {TaskId}: injected prior-work lineage ({Chars} chars, {Inputs} input(s))",
+                taskId, lineage.Length, inputs?.Count ?? 0);
+        }
+
         chatMessages.Add(new ChatMessage(ChatRole.User, description));
 
         // Long-term memory tools (search_memory, save_memory, etc.)
@@ -132,12 +170,13 @@ internal sealed class SubagentRunner(
         // tool-call discovery whose result is worth capturing as a typed asset; the main
         // agent reaches assets via skills the dream pass has already promoted.
         var skillTools = new SkillTools(skillStore, llmClient, logger, subagentSessionId,
-            enablePromote: true, resourceUsageStore: skillResourceUsageStore);
+            enablePromote: true, resourceUsageStore: skillResourceUsageStore,
+            mcpSkillSurface: mcpSkillSurface, mcpToolDirectory: mcpToolDirectory);
 
         // Working memory tools scoped to this subagent's namespace. The TTL floor keeps
         // findings alive until the primary reads them after batch consolidation.
         var sessionWorkingMemoryTools = new WorkingMemoryTools(workingMemory, subagentNamespace, logger,
-            workingMemoryOptions.Value.BackgroundTaskMinimumTtl);
+            workingMemoryOptions.Value.BackgroundTaskMinimumTtl, workingMemoryOptions.Value);
 
         // Registry tools — include MCP data tools and web/script tools.
         // Excluded:
@@ -217,12 +256,18 @@ internal sealed class SubagentRunner(
                 ReplyTo = $"{UserProxy.UserProxyTopics.UserResponse}.{agent.Name}"
             });
 
+            // #686: the subagent checks its own claims of work before they are relayed. It is a
+            // narrow check, not the full gate: it runs only when the subagent changed something,
+            // opened with "Done."-style claims, or claims a change no call made. A subagent once
+            // reported seven events "created and verified" when one create had succeeded.
             finalOutput = await agentLoopRunner.RunAsync(
                 chatMessages, chatOptions, subagentSessionId,
-                tier: tier, enableFollowUp: false, enableCompletionEval: false,
+                tier: tier, enableFollowUp: false, enableCompletionEval: true,
                 maxIterationsOverride: maxIterations,
                 diagnostics: diagnostics,
-                cancellationToken: ct);
+                cancellationToken: ct,
+                actionGate: actionGate,
+                completionEvalTriggers: SelfCheckTriggers);
             finalOutput = ResponseSanitizer.StripTrailingOffers(finalOutput);
             isSuccess = true;
             subagentActivity?.SetStatus(ActivityStatusCode.Ok);
@@ -305,6 +350,20 @@ internal sealed class SubagentRunner(
             }
         }
 
+        // The run is over and its session with it. Anything it left open there — an MCP question
+        // handed back to it and never answered — is released now rather than left waiting.
+        foreach (var listener in sessionEndListeners ?? [])
+        {
+            try
+            {
+                await listener.OnSessionEndedAsync(subagentNamespace, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Subagent {TaskId}: a session-end listener failed", taskId);
+            }
+        }
+
         subagentSw.Stop();
 
         SubagentDiagnostics.Duration.Record(subagentSw.Elapsed.TotalMilliseconds,
@@ -329,6 +388,11 @@ internal sealed class SubagentRunner(
             LatencyMs = subagentSw.ElapsedMilliseconds,
         });
 
+        // #683: the calls this run made travel with the result. The primary's synthesis turn only
+        // reads the saved output, so its completion check needs them to see the writes and uploads
+        // the relayed report describes.
+        var ledgerCalls = diagnostics.ToolCallLedger?.Snapshot();
+
         // Publish result
         var result = new SubagentResultMessage
         {
@@ -340,13 +404,44 @@ internal sealed class SubagentRunner(
             Error = error,
             Timestamp = DateTimeOffset.UtcNow,
             BatchId = batchId,
-            Consolidate = consolidate
+            Consolidate = consolidate,
+            OriginatingUserRequest = originatingUserRequest,
+            Description = description,
+            ToolCalls = ledgerCalls is null ? null : CompletionEvalTriggers.SummarizeForRelay(ledgerCalls),
+            ToolCallCount = ledgerCalls?.Count,
+            // #685: the synthesis turn relaying this result runs under the same gate.
+            RunOrigin = actionGate is null ? null : ActionGateScope.LogName(actionGate.Origin),
+            UserAskedFor = actionGate?.UserAskedFor is { } askedFor ? CompletionEvalTriggers.LogName(askedFor) : null,
         };
 
         var envelope = result.ToEnvelope<SubagentResultMessage>(source: subagentId);
         await publisher.PublishAsync($"{SubagentTopics.Result}.{agent.Name}", envelope, CancellationToken.None);
 
         logger.LogInformation("Subagent {TaskId} published result (success={Success})", taskId, isSuccess);
+    }
+
+    /// <summary>
+    /// The prior-work block for this subagent (#665), or null when there is none. Never throws:
+    /// lineage is an aid, and a failure building it must not stop the task.
+    /// </summary>
+    private string? BuildLineage(
+        string description, string? context, string primarySessionId,
+        string? originatingUserRequest, IReadOnlyList<SubagentInput>? inputs)
+    {
+        try
+        {
+            var snapshot = sessionWorkRegistry?.GetSnapshot(primarySessionId)
+                ?? SessionWorkSnapshot.Empty(SessionWorkRegistry.NormalizeSessionId(primarySessionId));
+            var budget = (subagentOptions?.Value ?? new SubagentOptions()).LineageInlineBudgetChars;
+            return SubagentLineage.Build(
+                snapshot, description, context, originatingUserRequest, inputs ?? [],
+                budget, DateTimeOffset.UtcNow);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Could not build prior-work lineage for a subagent of {Session}", primarySessionId);
+            return null;
+        }
     }
 
     /// <summary>
