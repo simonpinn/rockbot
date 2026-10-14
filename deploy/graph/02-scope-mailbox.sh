@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Limits the app to Mail.Read on the configured mailbox only, using Exchange RBAC for
-# Applications. Runs scope-mailbox.ps1 in the PowerShell container, so pwsh is not
-# needed on the host. Needs an Exchange admin to complete the device-code sign-in.
-# Safe to re-run.
+# Limits the app to Mail.Read, Calendars.ReadWrite and Contacts.ReadWrite on the configured
+# mailbox only, using Exchange RBAC for Applications. Runs scope-mailbox.ps1 in the PowerShell
+# container, so pwsh is not needed on the host. Needs an Exchange admin to complete the
+# device-code sign-in. Safe to re-run.
 #
 # Usage: 02-scope-mailbox.sh
 set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-[[ "${1:-}" != "-h" && "${1:-}" != "--help" ]] || { sed -n '2,8p' "$0"; exit 0; }
+[[ "${1:-}" != "-h" && "${1:-}" != "--help" ]] || { sed -n '2,7p' "$0"; exit 0; }
 
 require docker
 app_id="$(env_get GRAPH_CLIENT_ID)"

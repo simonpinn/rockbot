@@ -14,4 +14,10 @@ public sealed class GraphMailOptions
     [Required, EmailAddress] public string Mailbox { get; set; } = string.Empty;
 
     [Range(1_000, 200_000)] public int MaxBodyChars { get; set; } = 20_000;
+
+    /// <summary>
+    /// IANA or Windows time zone the calendar tools read and write in, e.g. Australia/Sydney.
+    /// Compose sets it from AGENT_TIMEZONE so the agent and the calendar agree on "today".
+    /// </summary>
+    [Required] public string TimeZone { get; set; } = "UTC";
 }

@@ -1,6 +1,5 @@
 using System.ComponentModel;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using McpServer.Graph.Services;
 using ModelContextProtocol;
 using ModelContextProtocol.Server;
@@ -8,7 +7,7 @@ using ModelContextProtocol.Server;
 namespace McpServer.Graph.Tools;
 
 [McpServerToolType]
-public sealed partial class MailTools(GraphMailClient client)
+public sealed class MailTools(GraphMailClient client)
 {
     private const int MaxTop = 25;
     private const int MaxSearchLength = 200;
@@ -81,19 +80,7 @@ public sealed partial class MailTools(GraphMailClient client)
         }
     }
 
-    private static void RequireTop(int top)
-    {
-        if (top is < 1 or > MaxTop)
-            throw new McpException($"top must be between 1 and {MaxTop}");
-    }
+    private static void RequireTop(int top) => ToolArgs.RequireTop(top, MaxTop);
 
-    private static void RequireGraphId(string value, string name)
-    {
-        if (!GraphIdPattern().IsMatch(value))
-            throw new McpException($"invalid {name}");
-    }
-
-    // Graph ids and well-known folder names are URL-safe base64 / plain words; anything else is rejected outright.
-    [GeneratedRegex("^[A-Za-z0-9_=-]{1,512}$")]
-    private static partial Regex GraphIdPattern();
+    private static void RequireGraphId(string value, string name) => ToolArgs.RequireGraphId(value, name);
 }

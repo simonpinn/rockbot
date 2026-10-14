@@ -1,5 +1,6 @@
-# Grants the RockBot app "Application Mail.Read" on exactly one mailbox via Exchange
-# RBAC for Applications, or removes that grant. Idempotent. Run by 02-scope-mailbox.sh
+# Grants the RockBot app "Application Mail.Read", "Application Calendars.ReadWrite" and
+# "Application Contacts.ReadWrite" on exactly one mailbox via Exchange RBAC for Applications,
+# or removes those grants. Idempotent. Run by 02-scope-mailbox.sh
 # and teardown.sh inside the PowerShell container; inputs come from the environment.
 $ErrorActionPreference = 'Stop'
 
@@ -11,9 +12,12 @@ $appName    = $env:APP_NAME
 if (-not $appId) { throw 'APP_ID is required' }
 
 # Names are derived from the app id so reruns find what earlier runs created.
-$scopeName      = "RockBot-Mailbox-$appId"
-$assignmentName = "RockBot-MailRead-$appId"
-$role           = 'Application Mail.Read'
+$scopeName   = "RockBot-Mailbox-$appId"
+$assignments = [ordered]@{
+    "RockBot-MailRead-$appId"           = 'Application Mail.Read'
+    "RockBot-CalendarsReadWrite-$appId" = 'Application Calendars.ReadWrite'
+    "RockBot-ContactsReadWrite-$appId"  = 'Application Contacts.ReadWrite'
+}
 
 function Find([scriptblock] $lookup) { try { & $lookup } catch { $null } }
 
@@ -29,10 +33,14 @@ Connect-ExchangeOnline -Device -ShowBanner:$false
 try {
     $sp         = Get-ServicePrincipal | Where-Object AppId -eq $appId
     $scope      = Find { Get-ManagementScope -Identity $scopeName }
-    $assignment = Find { Get-ManagementRoleAssignment -Identity $assignmentName }
 
     if ($action -eq 'remove') {
-        if ($assignment) { Remove-ManagementRoleAssignment -Identity $assignmentName -Confirm:$false; Write-Host "==> Removed role assignment $assignmentName" }
+        foreach ($assignmentName in $assignments.Keys) {
+            if (Find { Get-ManagementRoleAssignment -Identity $assignmentName }) {
+                Remove-ManagementRoleAssignment -Identity $assignmentName -Confirm:$false
+                Write-Host "==> Removed role assignment $assignmentName"
+            }
+        }
         if ($scope)      { Remove-ManagementScope -Identity $scopeName -Confirm:$false; Write-Host "==> Removed management scope $scopeName" }
         if ($sp)         { Remove-ServicePrincipal -Identity $sp.Identity -Confirm:$false; Write-Host "==> Removed Exchange service principal for $appId" }
         return
@@ -60,17 +68,21 @@ try {
         Write-Host "==> Found management scope $scopeName ($filter)"
     }
 
-    if (-not $assignment) {
-        New-ManagementRoleAssignment -Name $assignmentName -App $sp.Identity -Role $role -CustomResourceScope $scopeName | Out-Null
-        Write-Host "==> Created role assignment $assignmentName ($role, scoped to $smtp)"
-    } elseif ("$($assignment.CustomResourceScope)" -ne $scopeName) {
-        Set-ManagementRoleAssignment -Identity $assignmentName -CustomResourceScope $scopeName
-        Write-Host "==> Re-pointed role assignment $assignmentName at $scopeName"
-    } else {
-        Write-Host "==> Found role assignment $assignmentName"
+    foreach ($assignmentName in $assignments.Keys) {
+        $role       = $assignments[$assignmentName]
+        $assignment = Find { Get-ManagementRoleAssignment -Identity $assignmentName }
+        if (-not $assignment) {
+            New-ManagementRoleAssignment -Name $assignmentName -App $sp.Identity -Role $role -CustomResourceScope $scopeName | Out-Null
+            Write-Host "==> Created role assignment $assignmentName ($role, scoped to $smtp)"
+        } elseif ("$($assignment.CustomResourceScope)" -ne $scopeName) {
+            Set-ManagementRoleAssignment -Identity $assignmentName -CustomResourceScope $scopeName
+            Write-Host "==> Re-pointed role assignment $assignmentName at $scopeName"
+        } else {
+            Write-Host "==> Found role assignment $assignmentName ($role)"
+        }
     }
 
-    Write-Host "==> Effective permissions for $smtp (InScope should be True for $role):"
+    Write-Host "==> Effective permissions for $smtp (InScope should be True for each role above):"
     Test-ServicePrincipalAuthorization -Identity $sp.Identity -Resource $smtp | Format-List RoleName, GrantedPermissions, AllowedResourceScope, InScope
 }
 finally {

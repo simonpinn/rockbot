@@ -19,6 +19,7 @@ namespace McpServer.Graph.Tests;
 public abstract class GraphServerTestBase
 {
     protected const string Mailbox = "me@contoso.com";
+    protected const string TimeZone = "Australia/Sydney";
 
     private WebApplicationFactory<Program>? _factory;
     private McpClient? _client;
@@ -37,10 +38,11 @@ public abstract class GraphServerTestBase
             b.UseSetting("Graph:ClientSecret", "secret");
             b.UseSetting("Graph:Mailbox", Mailbox);
             b.UseSetting("Graph:MaxBodyChars", "1000");
+            b.UseSetting("Graph:TimeZone", TimeZone);
             b.ConfigureTestServices(services =>
             {
                 services.AddSingleton<TokenCredential>(new StubCredential());
-                services.AddHttpClient<GraphMailClient>().ConfigurePrimaryHttpMessageHandler(() => Graph);
+                services.AddHttpClient<GraphApi>().ConfigurePrimaryHttpMessageHandler(() => Graph);
             });
         });
 
@@ -89,6 +91,9 @@ public sealed class FakeGraphHandler : HttpMessageHandler
 {
     public List<HttpRequestMessage> Requests { get; } = [];
 
+    /// <summary>Each request's body, captured before the client disposes the request.</summary>
+    public List<string?> Bodies { get; } = [];
+
     public Func<HttpRequestMessage, HttpResponseMessage> Respond { get; set; } = _ => Json("""{"value":[]}""");
 
     public HttpRequestMessage Single => Requests.Single();
@@ -96,9 +101,12 @@ public sealed class FakeGraphHandler : HttpMessageHandler
     public static HttpResponseMessage Json(string json, HttpStatusCode status = HttpStatusCode.OK) =>
         new(status) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
 
-    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    public JsonElement BodyOf(int index) => JsonDocument.Parse(Bodies[index]!).RootElement.Clone();
+
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         Requests.Add(request);
-        return Task.FromResult(Respond(request));
+        Bodies.Add(request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken));
+        return Respond(request);
     }
 }

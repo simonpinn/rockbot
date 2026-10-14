@@ -187,8 +187,9 @@ services:
     volumes:
       - ${AGENT_DATA_PATH:-agent-data}:/data/agent
 
-  # Read-only Microsoft Graph mail tools for one mailbox (opt-in: COMPOSE_PROFILES=graph).
-  # Set up with deploy/graph/setup.sh. Only this container holds the client secret.
+  # Microsoft Graph tools for one mailbox: mail (read), calendar and contacts (read/write)
+  # (opt-in: COMPOSE_PROFILES=graph). Set up with deploy/graph/setup.sh. Only this container
+  # holds the client secret.
   graph-mcp:
     profiles: ["graph"]
     build:
@@ -201,6 +202,7 @@ services:
       Graph__ClientId: ${GRAPH_CLIENT_ID:-}
       Graph__ClientSecret: ${GRAPH_CLIENT_SECRET:-}
       Graph__Mailbox: ${GRAPH_MAILBOX:-}
+      Graph__TimeZone: ${AGENT_TIMEZONE:-America/Chicago}
 
   # Trello boards, lists and cards: read, create, update, move and comment; no archive or delete
   # (opt-in: COMPOSE_PROFILES=trello). Set up with deploy/trello/setup.sh. Only this container

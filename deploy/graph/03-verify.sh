@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checks the scoping end to end with the app's own credentials:
-#   - the configured mailbox is readable (HTTP 200)
-#   - another user's mailbox is NOT readable (HTTP 403), when --other-user is given
+#   - the configured mailbox's mail, calendar and contacts are readable (HTTP 200)
+#   - another user's mail, calendar and contacts are NOT readable (HTTP 403), when --other-user is given
 #   - the app has no tenant-wide Graph application permissions in Entra
 # Exits non-zero if any check fails. Safe to re-run.
 #
@@ -57,35 +57,42 @@ printf 'Authorization: Bearer %s\n' "$token" > "$work/auth.header"
 unset token
 log "PASS: obtained an app-only Graph token"
 
-# Prints the HTTP status of reading one message from the given mailbox.
-mailbox_status() {
+# Prints the HTTP status of reading one item of a kind (messages, calendar/events,
+# contacts) from the given mailbox.
+item_status() {
   local upn
   upn="$(jq -rn --arg v "$1" '$v|@uri')"
   curl -sS -o "$work/graph.json" -w '%{http_code}' -H "@$work/auth.header" \
-    "https://graph.microsoft.com/v1.0/users/$upn/messages?\$top=1&\$select=subject"
+    "https://graph.microsoft.com/v1.0/users/$upn/$2?\$top=1&\$select=id"
 }
 
 graph_error() { jq -r '.error.code + ": " + .error.message' "$work/graph.json" 2>/dev/null || true; }
 
-# 2. Own mailbox must be readable.
-status="$(mailbox_status "$mailbox")"
-case "$status" in
-  200) log "PASS: $mailbox is readable" ;;
-  403) warn "$mailbox returned 403 ($(graph_error))."
-       warn "If 02-scope-mailbox.sh ran recently, Exchange can take 30 minutes to 2 hours to apply it; re-run this script later."
-       failed=1 ;;
-  *)   warn "$mailbox returned $status ($(graph_error))"; failed=1 ;;
-esac
+kinds=(messages calendar/events contacts)
 
-# 3. Another mailbox must NOT be readable.
-if [[ -n "$other_user" ]]; then
-  status="$(mailbox_status "$other_user")"
+# 2. Own mailbox must be readable, for every kind.
+for kind in "${kinds[@]}"; do
+  status="$(item_status "$mailbox" "$kind")"
   case "$status" in
-    403) log "PASS: $other_user is denied (403), so access is limited to $mailbox" ;;
-    200) warn "FAIL: $other_user is readable. The app has tenant-wide mail access; see the Entra check below."; failed=1 ;;
-    404) warn "$other_user returned 404 (no such user or no mailbox); pick a user with a mailbox to prove the scoping" ;;
-    *)   warn "$other_user returned $status ($(graph_error))"; failed=1 ;;
+    200) log "PASS: $kind in $mailbox is readable" ;;
+    403) warn "$kind in $mailbox returned 403 ($(graph_error))."
+         warn "If 02-scope-mailbox.sh ran recently, Exchange can take 30 minutes to 2 hours to apply it; re-run this script later."
+         failed=1 ;;
+    *)   warn "$kind in $mailbox returned $status ($(graph_error))"; failed=1 ;;
   esac
+done
+
+# 3. Another mailbox must NOT be readable, for every kind.
+if [[ -n "$other_user" ]]; then
+  for kind in "${kinds[@]}"; do
+    status="$(item_status "$other_user" "$kind")"
+    case "$status" in
+      403) log "PASS: $kind in $other_user is denied (403), so access is limited to $mailbox" ;;
+      200) warn "FAIL: $kind in $other_user is readable. The app has tenant-wide access; see the Entra check below."; failed=1 ;;
+      404) warn "$other_user returned 404 for $kind (no such user or no mailbox); pick a user with a mailbox to prove the scoping" ;;
+      *)   warn "$kind in $other_user returned $status ($(graph_error))"; failed=1 ;;
+    esac
+  done
 else
   log "SKIP: pass --other-user someone@domain to prove other mailboxes are denied"
 fi

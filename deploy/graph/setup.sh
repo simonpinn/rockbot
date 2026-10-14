@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs the whole Graph mail setup: app registration, mailbox scoping, verification, and
-# compose wiring. Every step is idempotent, so re-run it whenever you like.
+# Runs the whole Graph setup (mail, calendar, contacts): app registration, mailbox scoping,
+# verification, and compose wiring. Every step is idempotent, so re-run it whenever you like.
 #
 # Usage: setup.sh --mailbox you@domain [--other-user someone@domain] [--app-name NAME] [--rotate]
 set -euo pipefail

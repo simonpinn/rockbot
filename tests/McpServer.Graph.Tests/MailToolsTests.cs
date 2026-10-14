@@ -159,16 +159,25 @@ public sealed class MailToolsTests : GraphServerTestBase
     }
 
     [TestMethod]
-    public async Task ListTools_ExposesOnlyReadOnlyMailToolsWithStrictSchemas()
+    public async Task ListTools_MailIsReadOnlyOnlyDeleteIsDestructiveAndAllSchemasAreStrict()
     {
         var tools = await (await ClientAsync()).ListToolsAsync();
 
-        CollectionAssert.AreEquivalent(
-            new[] { "get_message", "list_messages", "search_messages" },
-            tools.Select(t => t.Name).ToArray());
+        string[] readOnly =
+        [
+            "get_message", "list_messages", "search_messages",
+            "list_events", "get_event", "find_free_time",
+            "list_contacts", "search_contacts", "get_contact"
+        ];
+        string[] writes = ["create_event", "update_event", "delete_event", "respond_to_event", "create_contact", "update_contact"];
+        CollectionAssert.AreEquivalent(readOnly.Concat(writes).ToArray(), tools.Select(t => t.Name).ToArray());
+
         foreach (var tool in tools)
         {
-            Assert.IsTrue(tool.ProtocolTool.Annotations?.ReadOnlyHint, $"{tool.Name} is not marked read-only");
+            var annotations = tool.ProtocolTool.Annotations;
+            Assert.AreEqual(readOnly.Contains(tool.Name), annotations?.ReadOnlyHint ?? false, $"{tool.Name} read-only hint");
+            if (!readOnly.Contains(tool.Name))
+                Assert.AreEqual(tool.Name == "delete_event", annotations?.DestructiveHint ?? true, $"{tool.Name} destructive hint");
             Assert.IsFalse(tool.JsonSchema.GetProperty("additionalProperties").GetBoolean(), tool.Name);
         }
     }
