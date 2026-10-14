@@ -235,7 +235,9 @@ services:
       rabbitmq:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      # Loopback only by default: other machines should come in through the caddy service (HTTPS +
+      # sign-in, see deploy/https). Set BLAZOR_BIND=0.0.0.0 to expose plain http on the LAN instead.
+      - "${BLAZOR_BIND:-127.0.0.1}:8080:8080"
     environment:
       RabbitMq__HostName: rabbitmq
       RabbitMq__Port: "5672"
@@ -249,7 +251,8 @@ services:
       # the image runs as a non-root user. Kubernetes gets this free from fsGroup.
       DataProtection__KeyRingPath: /data/blazor/keys
       # -- OAuth sign-in (optional) --
-      # Off unless BLAZOR_AUTH_ENABLED=true in .env. Google is the only provider today.
+      # Off unless BLAZOR_AUTH_ENABLED=true in .env. Providers: Google and Microsoft (Entra ID).
+      # Microsoft sign-in over HTTPS on the LAN is scripted by deploy/https/setup.sh.
       #
       # http://localhost:8080 is the one origin Google accepts over plain http, so this
       # stack can exercise the real flow with no TLS. In the Google Cloud Console create
@@ -264,12 +267,38 @@ services:
       Auth__PublicBaseUrl: ${BLAZOR_AUTH_PUBLIC_BASE_URL:-http://localhost:8080}
       Auth__Providers__Google__ClientId: ${BLAZOR_AUTH_GOOGLE_CLIENT_ID:-}
       Auth__Providers__Google__ClientSecret: ${BLAZOR_AUTH_GOOGLE_CLIENT_SECRET:-}
+      Auth__Providers__Microsoft__ClientId: ${BLAZOR_AUTH_MICROSOFT_CLIENT_ID:-}
+      Auth__Providers__Microsoft__ClientSecret: ${BLAZOR_AUTH_MICROSOFT_CLIENT_SECRET:-}
+      Auth__Providers__Microsoft__TenantId: ${BLAZOR_AUTH_MICROSOFT_TENANT_ID:-}
       Auth__AllowedEmails__0: ${BLAZOR_AUTH_ALLOWED_EMAILS:-}
     volumes:
       - blazor-data:/data/blazor
+
+  # HTTPS front end for LAN access (opt-in: COMPOSE_PROFILES=https). Let's Encrypt certificate via
+  # a DNS-01 challenge on Azure DNS; set up with deploy/https/setup.sh.
+  caddy:
+    profiles: ["https"]
+    build:
+      context: ../caddy
+    image: rockbot-caddy:local
+    restart: unless-stopped
+    depends_on:
+      - blazor
+    ports:
+      - "443:443"
+    environment:
+      RB_PUBLIC_HOST: ${RB_PUBLIC_HOST:-}
+      AZURE_SUBSCRIPTION_ID: ${CADDY_AZURE_SUBSCRIPTION_ID:-}
+      AZURE_RESOURCE_GROUP_NAME: ${CADDY_AZURE_RESOURCE_GROUP:-}
+      AZURE_TENANT_ID: ${CADDY_AZURE_TENANT_ID:-}
+      AZURE_CLIENT_ID: ${CADDY_AZURE_CLIENT_ID:-}
+      AZURE_CLIENT_SECRET: ${CADDY_AZURE_CLIENT_SECRET:-}
+    volumes:
+      - caddy-data:/data
 
 volumes:
   rabbitmq-data:
   agent-data:
   shared:
   blazor-data:
+  caddy-data:

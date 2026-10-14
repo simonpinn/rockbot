@@ -119,6 +119,35 @@ public static class AuthSetup
                     });
                     break;
 
+                case AuthProviderRegistry.MicrosoftScheme:
+                    builder.AddOpenIdConnect(AuthProviderRegistry.MicrosoftScheme, provider.DisplayName, oidc =>
+                    {
+                        // Single tenant only; AuthOptions.Validate refuses anything but a GUID.
+                        var issuer = $"https://login.microsoftonline.com/{credentials.TenantId}/v2.0";
+                        oidc.Authority = issuer;
+                        oidc.ClientId = credentials.ClientId;
+                        oidc.ClientSecret = credentials.ClientSecret;
+                        oidc.ResponseType = "code";
+                        oidc.UsePkce = true;
+                        // The value registered as the app's web redirect URI: https://{host}/signin-microsoft
+                        oidc.CallbackPath = "/signin-microsoft";
+                        oidc.SignedOutCallbackPath = "/signout-callback-microsoft";
+                        oidc.Scope.Clear();
+                        oidc.Scope.Add("openid");
+                        oidc.Scope.Add("profile");
+                        oidc.Scope.Add("email");
+                        oidc.SaveTokens = false;
+                        oidc.GetClaimsFromUserInfoEndpoint = false;
+                        oidc.TokenValidationParameters.ValidIssuer = issuer;
+                        oidc.Events.OnTokenValidated = context =>
+                        {
+                            if (context.Principal?.Identity is ClaimsIdentity identity)
+                                EntraClaims.EnsureEmail(identity);
+                            return Task.CompletedTask;
+                        };
+                    });
+                    break;
+
                 default:
                     throw new InvalidOperationException(
                         $"No handler registration exists for provider scheme '{provider.Scheme}'.");

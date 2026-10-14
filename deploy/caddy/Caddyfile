@@ -1,0 +1,27 @@
+# HTTPS front end for the Blazor UI. The certificate comes from Let's Encrypt via a DNS-01
+# challenge against Azure DNS, so the host never has to be reachable from the internet.
+{
+	admin off
+}
+
+{$RB_PUBLIC_HOST} {
+	tls {
+		dns azure {
+			subscription_id {$AZURE_SUBSCRIPTION_ID}
+			resource_group_name {$AZURE_RESOURCE_GROUP_NAME}
+			tenant_id {$AZURE_TENANT_ID}
+			client_id {$AZURE_CLIENT_ID}
+			client_secret {$AZURE_CLIENT_SECRET}
+		}
+		# Public resolvers: the LAN resolver may not see the delegated zone yet.
+		resolvers 1.1.1.1 8.8.8.8
+	}
+
+	encode zstd gzip
+	reverse_proxy blazor:8080
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}

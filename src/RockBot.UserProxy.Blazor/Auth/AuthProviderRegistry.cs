@@ -15,8 +15,8 @@ public sealed record AuthProvider(string Key, string Scheme, string DisplayName)
 /// offered as a button or accepted as a <c>?provider=</c> value.
 /// </summary>
 /// <remarks>
-/// Only Google ships today, but nothing outside <see cref="Descriptors"/> and the registration
-/// switch in <c>AuthSetup</c> knows that. Adding Microsoft or GitHub is a package reference, a
+/// Google and Microsoft ship today; nothing outside <see cref="Descriptors"/> and the registration
+/// switch in <c>AuthSetup</c> knows that. Adding another provider is a package reference, a
 /// descriptor entry, and one registration line.
 /// </remarks>
 public sealed class AuthProviderRegistry
@@ -25,10 +25,14 @@ public sealed class AuthProviderRegistry
     private static readonly IReadOnlyList<AuthProvider> Descriptors =
     [
         new AuthProvider("Google", GoogleScheme, "Google"),
+        new AuthProvider("Microsoft", MicrosoftScheme, "Microsoft"),
     ];
 
     /// <summary>Scheme name registered by <c>AddGoogle()</c>; its callback path is <c>/signin-google</c>.</summary>
     public const string GoogleScheme = "Google";
+
+    /// <summary>Scheme name of the Entra ID OpenID Connect handler; its callback path is <c>/signin-microsoft</c>.</summary>
+    public const string MicrosoftScheme = "Microsoft";
 
     private readonly Dictionary<string, AuthProvider> _byKey;
 
