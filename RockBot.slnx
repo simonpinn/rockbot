@@ -9,6 +9,7 @@
     <Project Path="src/McpServer.ElicitationFixture/McpServer.ElicitationFixture.csproj" />
     <Project Path="src/McpServer.Graph/McpServer.Graph.csproj" />
     <Project Path="src/McpServer.Introspection/McpServer.Introspection.csproj" />
+    <Project Path="src/McpServer.Obsidian/McpServer.Obsidian.csproj" />
     <Project Path="src/McpServer.OpenRouter/McpServer.OpenRouter.csproj" />
 <Project Path="src/McpServer.TodoApp/McpServer.TodoApp.csproj" />
     <Project Path="src/McpServer.Trello/McpServer.Trello.csproj" />
@@ -62,6 +63,7 @@
     <Project Path="tests/RockBot.Tools.Tests/RockBot.Tools.Tests.csproj" />
     <Project Path="tests/McpServer.TodoApp.Tests/McpServer.TodoApp.Tests.csproj" />
     <Project Path="tests/McpServer.Graph.Tests/McpServer.Graph.Tests.csproj" />
+    <Project Path="tests/McpServer.Obsidian.Tests/McpServer.Obsidian.Tests.csproj" />
     <Project Path="tests/McpServer.Trello.Tests/McpServer.Trello.Tests.csproj" />
     <Project Path="tests/RockBot.Scripts.Tests/RockBot.Scripts.Tests.csproj" />
     <Project Path="tests/RockBot.A2A.Tests/RockBot.A2A.Tests.csproj" />

@@ -219,6 +219,84 @@ services:
       Trello__Token: ${TRELLO_TOKEN:-}
       Trello__AllowedBoardIds: ${TRELLO_ALLOWED_BOARD_IDS:-}
 
+  # Obsidian vault (opt-in: COMPOSE_PROFILES=obsidian). Set up with deploy/obsidian/setup.sh.
+  # obsidian-sync runs Obsidian's headless Sync client, keeping the obsidian-vault volume in two-way
+  # sync with one remote vault; only it holds the Obsidian login. obsidian-mcp gives the agent
+  # search/read over the whole vault and create/append only under OBSIDIAN_WRITE_FOLDER.
+  # Both run as uid 1000 so either can write the notes the other created.
+  obsidian-sync:
+    profiles: ["obsidian"]
+    build:
+      context: ../obsidian
+      dockerfile: Dockerfile.sync
+    image: rockbot-obsidian-sync:latest
+    restart: unless-stopped
+    volumes:
+      - obsidian-vault:/vault
+      - obsidian-config:/config
+
+  obsidian-mcp:
+    profiles: ["obsidian"]
+    build:
+      context: ../..
+      dockerfile: src/McpServer.Obsidian/Dockerfile
+    image: rockylhotka/rockbot-obsidian-mcp:latest
+    restart: unless-stopped
+    user: "1000:1000"
+    depends_on:
+      - obsidian-sync   # creates /vault with the right owner on first start
+    environment:
+      Obsidian__VaultPath: /vault
+      Obsidian__WriteFolder: ${OBSIDIAN_WRITE_FOLDER:-RockBot}
+      Obsidian__VaultName: ${OBSIDIAN_VAULT_NAME:-}
+      Obsidian__TimeZone: ${AGENT_TIMEZONE:-America/Chicago}
+    volumes:
+      - obsidian-vault:/vault
+
+  # Advisor council and its research helper (opt-in: COMPOSE_PROFILES=council). Each answers one
+  # A2A task and exits, as in Kubernetes where KEDA starts a pod per task; here `restart: always`
+  # brings it straight back. Their queues are durable, so a task sent mid-restart waits for it.
+  # Both use the agent's OpenAI-compatible LLM settings (not the Copilot provider).
+  advisor-council:
+    profiles: ["council"]
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile.advisor-council
+    image: rockylhotka/rockbot-advisor-council:latest
+    restart: always
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment: &council-env
+      RabbitMq__HostName: rabbitmq
+      RabbitMq__Port: "5672"
+      RabbitMq__UserName: rockbot
+      RabbitMq__Password: rockbot
+      RabbitMq__VirtualHost: /
+      LLM__Balanced__Endpoint: ${LLM_ENDPOINT:-}
+      LLM__Balanced__ApiKey: ${LLM_API_KEY:-}
+      LLM__Balanced__ModelId: ${LLM_MODEL_ID:-anthropic/claude-haiku-4.5}
+      # The High tier (the council's synthesis) needs its own endpoint and key; it does not
+      # inherit Balanced's. Falls back to the Balanced model when LLM_HIGH_MODEL_ID is unset.
+      LLM__High__Endpoint: ${LLM_ENDPOINT:-}
+      LLM__High__ApiKey: ${LLM_API_KEY:-}
+      LLM__High__ModelId: ${LLM_HIGH_MODEL_ID:-${LLM_MODEL_ID:-anthropic/claude-haiku-4.5}}
+      Agent__Timezone: ${AGENT_TIMEZONE:-America/Chicago}
+
+  research-agent:
+    profiles: ["council"]
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile.research-agent
+    image: rockylhotka/rockbot-research-agent:latest
+    restart: always
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      <<: *council-env
+      WebTools__ApiKey: ${BRAVE_API_KEY:-}
+
   blazor-init:
     image: busybox:latest
     user: root
@@ -304,3 +382,5 @@ volumes:
   shared:
   blazor-data:
   caddy-data:
+  obsidian-vault:
+  obsidian-config:
