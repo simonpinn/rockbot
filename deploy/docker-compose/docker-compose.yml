@@ -114,6 +114,13 @@ services:
       # OpenAI-compatible path (ignored when Provider=Copilot)
       LLM__Balanced__Endpoint: ${LLM_ENDPOINT:-}
       LLM__Balanced__ApiKey: ${LLM_API_KEY:-}
+      # A tier with only a ModelId doesn't inherit Balanced's endpoint/key, so setting
+      # LLM_LOW/HIGH_MODEL_ID alone would crash the agent at startup. With no ModelId a
+      # tier still falls back to Balanced, so these are harmless when unset.
+      LLM__Low__Endpoint: ${LLM_ENDPOINT:-}
+      LLM__Low__ApiKey: ${LLM_API_KEY:-}
+      LLM__High__Endpoint: ${LLM_ENDPOINT:-}
+      LLM__High__ApiKey: ${LLM_API_KEY:-}
       # -- Web search --
       WebTools__ApiKey: ${BRAVE_API_KEY:-}
       # -- Embedding (optional — enables hybrid vector search) --
