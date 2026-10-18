@@ -1,0 +1,13 @@
+# Obsidian's official headless Sync client (https://obsidian.md/help/sync/headless), keeping
+# /vault in two-way sync with one remote vault. Login and vault binding live in /config.
+FROM node:22-slim
+
+RUN npm install -g obsidian-headless@0.0.14 && npm cache clean --force \
+    && mkdir -p /vault /config && chown node:node /vault /config
+
+# ob keeps its token and per-vault settings in $XDG_CONFIG_HOME/obsidian-headless.
+ENV XDG_CONFIG_HOME=/config
+USER node
+WORKDIR /vault
+
+CMD ["ob", "sync", "--continuous", "--path", "/vault"]

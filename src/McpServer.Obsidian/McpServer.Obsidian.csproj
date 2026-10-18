@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>McpServer.Obsidian</RootNamespace>
+    <UserSecretsId>mcpserver-obsidian-3f7a9c2e-1b4d-4e8f-a6c5-9d2e7b1f4a3c</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\McpServer.TodoApp\StrictArguments.cs" Link="StrictArguments.cs" />
+  </ItemGroup>
+
+</Project>

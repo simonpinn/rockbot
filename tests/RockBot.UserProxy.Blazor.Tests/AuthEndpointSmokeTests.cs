@@ -21,7 +21,8 @@ public class AuthEndpointSmokeTests
     /// message-bus listener is a hosted service that dials RabbitMQ on start; the HTTP surface does
     /// not need it, and requiring a live broker would make these an integration suite.
     /// </summary>
-    private sealed class Host(Dictionary<string, string?> settings) : WebApplicationFactory<Program>
+    internal sealed class Host(Dictionary<string, string?> settings, Action<IServiceCollection>? configureServices = null)
+        : WebApplicationFactory<Program>
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -33,7 +34,11 @@ public class AuthEndpointSmokeTests
 
             // ConfigureTestServices, not ConfigureServices: it runs after the app's own
             // registrations, which is the only point at which there is anything to remove.
-            builder.ConfigureTestServices(RemoveApplicationHostedServices);
+            builder.ConfigureTestServices(services =>
+            {
+                RemoveApplicationHostedServices(services);
+                configureServices?.Invoke(services);
+            });
         }
 
         /// <summary>

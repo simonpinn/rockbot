@@ -49,7 +49,7 @@ public sealed class AuthOptions
     public IList<string> AllowedDomains { get; set; } = new List<string>();
 
     /// <summary>
-    /// Configured identity providers, keyed by provider name (<c>Google</c> today). A provider is
+    /// Configured identity providers, keyed by provider name (<c>Google</c>, <c>Microsoft</c>). A provider is
     /// "enabled" when it appears here with both a client ID and secret.
     /// </summary>
     public IDictionary<string, OAuthProviderOptions> Providers { get; set; }
@@ -74,8 +74,22 @@ public sealed class AuthOptions
         {
             yield return
                 "Auth:Enabled is true but no identity provider is configured. Set " +
-                "Auth:Providers:Google:ClientId and Auth:Providers:Google:ClientSecret, or set " +
+                "Auth:Providers:Google:ClientId and Auth:Providers:Google:ClientSecret, or " +
+                "Auth:Providers:Microsoft:ClientId, ClientSecret and TenantId, or set " +
                 "Auth:Enabled to false. Starting without a provider would serve the UI with no way in.";
+        }
+
+        if (Providers.TryGetValue(AuthProviderRegistry.MicrosoftScheme, out var microsoft)
+            && microsoft is not null && microsoft.IsConfigured
+            && !Guid.TryParse(microsoft.TenantId, out _))
+        {
+            // A multi-tenant authority (common/organizations/consumers) accepts tokens minted by
+            // any tenant, and another tenant's admin can set a user's unverified email to an
+            // address on our allowlist. Pinning one tenant is what makes the email claim trustworthy.
+            yield return
+                "Auth:Providers:Microsoft:TenantId must be your Entra tenant's GUID " +
+                $"(got '{microsoft.TenantId}'). Multi-tenant values such as 'common' or " +
+                "'organizations' are refused: any tenant could then sign in with an allowlisted email.";
         }
 
         var hasEmails = AllowedEmails.Any(e => !string.IsNullOrWhiteSpace(e));
@@ -105,6 +119,9 @@ public sealed class OAuthProviderOptions
 
     /// <summary>OAuth client secret issued by the provider. Belongs in a Secret, never a ConfigMap.</summary>
     public string ClientSecret { get; set; } = "";
+
+    /// <summary>Entra tenant GUID. Required by the Microsoft provider, ignored by the others.</summary>
+    public string TenantId { get; set; } = "";
 
     /// <summary>A provider only counts as configured when both halves of the credential are present.</summary>
     public bool IsConfigured =>
