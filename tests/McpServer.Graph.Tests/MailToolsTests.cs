@@ -165,7 +165,7 @@ public sealed class MailToolsTests : GraphServerTestBase
 
         string[] readOnly =
         [
-            "get_message", "list_messages", "search_messages",
+            "get_message", "list_messages", "search_messages", "get_attachment",
             "list_events", "get_event", "find_free_time",
             "list_contacts", "search_contacts", "get_contact"
         ];

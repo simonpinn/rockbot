@@ -11,6 +11,15 @@ the only thing that holds the client secret. The agent sees these tools:
 | Calendar | `list_events`, `get_event`, `find_free_time` (read); `create_event`, `update_event`, `respond_to_event`, `delete_event` (write) |
 | Contacts | `list_contacts`, `search_contacts`, `get_contact` (read); `create_contact`, `update_contact` (write; no delete) |
 
+`get_message` lists a message's attachments, and `get_attachment` fetches one (up to 25 MB,
+`Graph__MaxAttachmentBytes`):
+- text files come back as text;
+- attached emails come back as a readable message;
+- other files are returned as base64. A capture rule that `04-enable-compose.sh` adds to the
+  `graph-mail` entry in `mcp.json` makes the agent's bridge save them under
+  `/rockbot/shared/attachments/` and hand the model the path, so they never land in its context.
+  `Mail.Read` covers attachments; no extra permission is needed.
+
 Scoping is done with Exchange **RBAC for Applications**: the app has no tenant-wide
 Graph permission in Entra, only `Application Mail.Read`, `Application Calendars.ReadWrite`
 and `Application Contacts.ReadWrite` on a management scope that matches your mailbox.

@@ -32,6 +32,7 @@ public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
     private int _consecutiveTimeoutIterations;
     private int? _knownContextLimit;
     private readonly AgentLoopRunner.RepetitiveToolCallDetector _repetitiveCallDetector = new();
+    private readonly AgentLoopRunner.DuplicateToolCallGuard _duplicateCallGuard = new();
 
     public RockBotFunctionInvokingChatClient(
         IChatClient innerClient,
@@ -284,6 +285,13 @@ public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
 
         TierEscalationContext.Value?.ObserveToolResult(callContent.Name, isError: status != "ok");
 
+        // A successful call with arguments identical to an earlier one this turn — detected
+        // even when the two aren't consecutive, unlike the detector below. The content shown
+        // to the model is swapped for a short pointer just before return; diagnostics, the
+        // ledger and the tool-call log below still see the real result.
+        var isDuplicateCall = status == "ok"
+            && _duplicateCallGuard.WasSeenBefore(callContent.Name, argsSummary ?? string.Empty);
+
         // Track consecutive identical (tool, args, result) triples to detect stuck loops.
         if (_repetitiveCallDetector.Track(callContent.Name, argsSummary ?? string.Empty, resultStr ?? string.Empty))
         {
@@ -376,6 +384,12 @@ public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
             await _progressNotifier.OnToolInvokedAsync(callContent.Name, summary, cancellationToken);
         }
 
+        if (isDuplicateCall)
+        {
+            result = $"(duplicate call — {callContent.Name} already returned this exact result " +
+                     "earlier in this turn with identical arguments; reuse it instead of calling again)";
+        }
+
         return result;
     }
 
@@ -386,6 +400,7 @@ public class RockBotFunctionInvokingChatClient : FunctionInvokingChatClient
     {
         _consecutiveTimeoutIterations = 0;
         _repetitiveCallDetector.Reset();
+        _duplicateCallGuard.Reset();
 
         // Apply per-request max iterations override if set (e.g. by a subagent
         // that was spawned with an elevated iteration budget).

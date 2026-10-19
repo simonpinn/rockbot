@@ -6,6 +6,9 @@ using McpServer.Graph.Tools;
 using McpServer.TodoApp;
 using Microsoft.Extensions.Options;
 
+// Attachments may declare legacy charsets such as windows-1252.
+System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddOptions<GraphMailOptions>()

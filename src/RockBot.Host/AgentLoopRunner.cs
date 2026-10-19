@@ -316,6 +316,30 @@ public sealed partial class AgentLoopRunner(
         private static partial Regex DurationRegex();
     }
 
+    /// <summary>
+    /// Tracks which (tool name, arguments) pairs have already produced a successful result
+    /// earlier in the same loop run, so a later identical call — even when it isn't consecutive
+    /// with the first, unlike <see cref="RepetitiveToolCallDetector"/> — doesn't re-append its
+    /// full result to context. The call itself is still made (not every tool is safe to skip,
+    /// and a repeat can legitimately return fresh data); only what gets shown to the model a
+    /// second time is replaced with a short pointer. Internal and sealed so it can be
+    /// unit-tested directly. Thread-safe.
+    /// </summary>
+    internal sealed class DuplicateToolCallGuard
+    {
+        private readonly ConcurrentDictionary<string, byte> _seen = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Records a successful (toolName, argsKey) call and returns <c>true</c> when that
+        /// exact pair already succeeded earlier in this run.
+        /// </summary>
+        public bool WasSeenBefore(string toolName, string argsKey) =>
+            !_seen.TryAdd($"{toolName}␟{argsKey}", 0);
+
+        /// <summary>Clears all tracked calls so a reused instance can start a fresh run.</summary>
+        public void Reset() => _seen.Clear();
+    }
+
     private sealed record CompletionEvalDto(bool Complete, string? Reason);
     private sealed record FollowUpEvalDto(bool HasFollowUps, string? Prompt, string? SearchTerms);
 
@@ -1286,6 +1310,7 @@ public sealed partial class AgentLoopRunner(
             ?? hostOptions.Value.MaxToolIterations;
         var consecutiveTimeoutIterations = 0;
         var repetitiveCallDetector = new RepetitiveToolCallDetector();
+        var duplicateCallGuard = new DuplicateToolCallGuard();
 
         try
         {
@@ -1604,8 +1629,14 @@ public sealed partial class AgentLoopRunner(
                             ttl: ttl,
                             logger: logger);
                     }
+                    var isDuplicateTextCall = textToolStatus == "ok"
+                        && duplicateCallGuard.WasSeenBefore(toolName, argsJson);
                     chatMessages.Add(new ChatMessage(ChatRole.User,
-                        $"[Tool result for {toolName}]: {textResultStr}"));
+                        isDuplicateTextCall
+                            ? $"[Tool result for {toolName}]: (duplicate call — {toolName} already " +
+                              "returned this exact result earlier in this turn with identical " +
+                              "arguments; reuse it instead of calling again)"
+                            : $"[Tool result for {toolName}]: {textResultStr}"));
 
                     if (repetitiveCallDetector.Track(toolName, argsJson, textResultStr))
                     {
@@ -1769,8 +1800,15 @@ public sealed partial class AgentLoopRunner(
                     }
                 }
 
+                var isDuplicateNativeCall = toolStatus == "ok"
+                    && duplicateCallGuard.WasSeenBefore(fc.Name, argsSummary);
                 chatMessages.Add(new ChatMessage(ChatRole.Tool,
-                    [new FunctionResultContent(fc.CallId, nativeResultStr)]));
+                    [new FunctionResultContent(fc.CallId,
+                        isDuplicateNativeCall
+                            ? $"(duplicate call — {fc.Name} already returned this exact result " +
+                              "earlier in this turn with identical arguments; reuse it instead " +
+                              "of calling again)"
+                            : nativeResultStr)]));
 
                 if (repetitiveCallDetector.Track(fc.Name, argsSummary, nativeResultStr))
                 {

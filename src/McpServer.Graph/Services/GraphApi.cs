@@ -56,6 +56,40 @@ public sealed class GraphApi(HttpClient http, IOptions<GraphMailOptions> options
         }
     }
 
+    /// <summary>GETs raw bytes (e.g. an attachment's <c>$value</c>), refusing bodies over <paramref name="maxBytes"/>.</summary>
+    public async Task<byte[]> GetBytesAsync(string relativeUri, string feature, long maxBytes, CancellationToken ct)
+    {
+        HttpResponseMessage response;
+        try
+        {
+            response = await http.GetAsync(relativeUri, HttpCompletionOption.ResponseHeadersRead, ct);
+        }
+        catch (AuthenticationFailedException ex)
+        {
+            throw new McpException($"could not authenticate to Microsoft Graph; check the GRAPH_* settings: {ex.Message}", ex);
+        }
+
+        using (response)
+        {
+            if (!response.IsSuccessStatusCode)
+                throw new McpException(DescribeFailure(response.StatusCode, await response.Content.ReadAsStringAsync(ct), feature));
+            if (response.Content.Headers.ContentLength > maxBytes)
+                throw new McpException($"the content is larger than the {maxBytes / 1_048_576} MB limit");
+
+            await using var stream = await response.Content.ReadAsStreamAsync(ct);
+            using var buffer = new MemoryStream();
+            var chunk = new byte[81_920];
+            int read;
+            while ((read = await stream.ReadAsync(chunk, ct)) > 0)
+            {
+                if (buffer.Length + read > maxBytes)
+                    throw new McpException($"the content is larger than the {maxBytes / 1_048_576} MB limit");
+                buffer.Write(chunk, 0, read);
+            }
+            return buffer.ToArray();
+        }
+    }
+
     private static string DescribeFailure(HttpStatusCode status, string content, string feature)
     {
         var detail = "";

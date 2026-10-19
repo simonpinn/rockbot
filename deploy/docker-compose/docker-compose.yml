@@ -226,6 +226,41 @@ services:
       Trello__Token: ${TRELLO_TOKEN:-}
       Trello__AllowedBoardIds: ${TRELLO_ALLOWED_BOARD_IDS:-}
 
+  # Gmail, read + search + drafts (never send), across several accounts (opt-in:
+  # COMPOSE_PROFILES=gmail). Set up with deploy/gmail/setup.sh --account NAME, once per account.
+  # The per-account settings are in the generated gmail.env, which points at the
+  # GMAIL_<NAME>_REFRESH_TOKEN values in .env.
+  gmail-mcp:
+    profiles: ["gmail"]
+    build:
+      context: ../..
+      dockerfile: src/McpServer.Gmail/Dockerfile
+    image: rockylhotka/rockbot-gmail-mcp:latest
+    restart: unless-stopped
+    env_file:
+      - path: gmail.env
+        required: false
+    environment:
+      Gmail__ClientId: ${GMAIL_CLIENT_ID:-}
+      Gmail__ClientSecret: ${GMAIL_CLIENT_SECRET:-}
+      Gmail__TimeZone: ${AGENT_TIMEZONE:-America/Chicago}
+
+  # Slack, read and search only, across several workspaces (opt-in: COMPOSE_PROFILES=slack). Set up
+  # with deploy/slack/setup.sh --workspace NAME, once per workspace. The per-workspace settings are
+  # in the generated slack.env, which points at the SLACK_<NAME>_TOKEN values in .env.
+  slack-mcp:
+    profiles: ["slack"]
+    build:
+      context: ../..
+      dockerfile: src/McpServer.Slack/Dockerfile
+    image: rockylhotka/rockbot-slack-mcp:latest
+    restart: unless-stopped
+    env_file:
+      - path: slack.env
+        required: false
+    environment:
+      Slack__TimeZone: ${AGENT_TIMEZONE:-America/Chicago}
+
   # Obsidian vault (opt-in: COMPOSE_PROFILES=obsidian). Set up with deploy/obsidian/setup.sh.
   # obsidian-sync runs Obsidian's headless Sync client, keeping the obsidian-vault volume in two-way
   # sync with one remote vault; only it holds the Obsidian login. obsidian-mcp gives the agent

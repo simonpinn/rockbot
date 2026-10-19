@@ -19,4 +19,8 @@ enable_profile graph
 log "Building and starting graph-mcp"
 "${COMPOSE[@]}" up -d --build graph-mcp
 
-register_mcp_server graph-mail '{"type":"sse","url":"http://graph-mcp:8080/"}'
+# get_attachment returns binary files as base64 in "content"; the capture rule has the bridge save
+# them to the shared volume and hand the model a path instead. No mimeField on purpose: the type is
+# then inferred from the file name, and unknown extensions count as binary.
+register_mcp_server graph-mail '{"type":"sse","url":"http://graph-mcp:8080/",
+  "attachments":{"capture":{"rules":[{"tools":["get_attachment"],"contentField":"content","nameField":"name"}]}}}'

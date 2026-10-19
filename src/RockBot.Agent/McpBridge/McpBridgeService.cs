@@ -2377,11 +2377,15 @@ public sealed class McpBridgeService : IHostedService, IAsyncDisposable
 
             await PublishToTargetAsync(error, target, ct);
         }
-        catch (McpProtocolException ex) when (ex.ErrorCode is McpErrorCode.InvalidParams or McpErrorCode.MethodNotFound)
+        catch (McpProtocolException ex) when (
+            ex.ErrorCode is McpErrorCode.InvalidParams or McpErrorCode.MethodNotFound
+            || ex.Message.Contains("unknown tool", StringComparison.OrdinalIgnoreCase))
         {
             // The server answered, so the connection is alive: reconnecting and retrying would only
             // repeat the rejection. Servers on other SDKs report argument validation this way rather
-            // than as an isError result. Return it as a tool error the model can act on.
+            // than as an isError result. Matched by message too: an "unknown tool" rejection is
+            // documented as McpErrorCode.InvalidParams, but has been observed in practice surfacing
+            // with a different ErrorCode — message content is the reliable signal either way.
             sw.Stop();
             _logger.LogWarning("← MCP {Server}/{Tool} REJECTED in {ElapsedMs}ms ({Code}): {Message}",
                 serverName, request.ToolName, sw.ElapsedMilliseconds, ex.ErrorCode, ex.Message);
@@ -2450,6 +2454,16 @@ public sealed class McpBridgeService : IHostedService, IAsyncDisposable
         catch (Exception ex)
         {
             sw.Stop();
+
+            // A McpProtocolException reaching this generic catch means the message-based filter
+            // above didn't recognize it as a protocol rejection either — log the ErrorCode so a
+            // mismatch like that is visible instead of silently eating a ~30s reconnect.
+            if (ex is McpProtocolException unmatchedProtoEx)
+            {
+                _logger.LogWarning(
+                    "← MCP {Server}/{Tool} protocol exception (ErrorCode={ErrorCode}) fell through to the generic reconnect path: {Message}",
+                    serverName, request.ToolName, unmatchedProtoEx.ErrorCode, unmatchedProtoEx.Message);
+            }
 
             // The first attempt is over. Close its scope before any retry: when the reconnect
             // fails quietly and keeps the same coordinator, a still-open scope would carry this

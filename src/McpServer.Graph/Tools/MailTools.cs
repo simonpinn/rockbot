@@ -63,7 +63,9 @@ public sealed class MailTools(GraphMailClient client)
 
     [McpServerTool(Name = "get_message", ReadOnly = true)]
     [Description("Gets one message from the configured mailbox with its body as plain text (long bodies are truncated; bodyTruncated says so). " +
-                 "Returns JSON { id, subject, from, to, cc, received, isRead, hasAttachments, body, bodyTruncated }." + UntrustedNote)]
+                 "Returns JSON { id, subject, from, to, cc, received, isRead, hasAttachments, body, bodyTruncated, attachments }, " +
+                 "where attachments is [{ id, name, kind (file|item|reference), contentType, size, isInline }]; " +
+                 "fetch one with get_attachment. Inline attachments are usually signature images." + UntrustedNote)]
     public async Task<string> GetMessageAsync(
         [Description("Message id, as returned by list_messages or search_messages.")] string id,
         CancellationToken cancellationToken = default)
@@ -73,6 +75,30 @@ public sealed class MailTools(GraphMailClient client)
             RequireGraphId(id, nameof(id));
             var message = await client.GetMessageAsync(id, cancellationToken);
             return JsonSerializer.Serialize(message, JsonOptions);
+        }
+        catch (Exception ex) when (ex is not McpException)
+        {
+            throw new McpException(ex.Message, ex);
+        }
+    }
+
+    [McpServerTool(Name = "get_attachment", ReadOnly = true)]
+    [Description("Gets one attachment of a message in the configured mailbox. Text files (txt, csv, json, html, ics, ...) come back " +
+                 "as 'text'. Other files (PDF, Office documents, images, archives) are saved to the shared volume and come back as " +
+                 "{ path, name, size, mime }: pass that path to analyze_file or file_read to look inside. An attached email comes back " +
+                 "as 'message' { subject, from, to, received, body }. Cloud-link attachments can't be downloaded. Files over the size " +
+                 "limit (25 MB by default) are refused." + UntrustedNote)]
+    public async Task<string> GetAttachmentAsync(
+        [Description("Message id, as returned by list_messages, search_messages or get_message.")] string message_id,
+        [Description("Attachment id, taken from the 'attachments' array returned by get_message.")] string attachment_id,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            RequireGraphId(message_id, nameof(message_id));
+            RequireGraphId(attachment_id, nameof(attachment_id));
+            var attachment = await client.GetAttachmentAsync(message_id, attachment_id, cancellationToken);
+            return JsonSerializer.Serialize(attachment, JsonOptions);
         }
         catch (Exception ex) when (ex is not McpException)
         {

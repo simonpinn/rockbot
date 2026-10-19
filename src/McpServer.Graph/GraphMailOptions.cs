@@ -15,6 +15,9 @@ public sealed class GraphMailOptions
 
     [Range(1_000, 200_000)] public int MaxBodyChars { get; set; } = 20_000;
 
+    /// <summary>Largest attachment get_attachment downloads. Graph allows up to 150 MB.</summary>
+    [Range(1_024, 157_286_400)] public long MaxAttachmentBytes { get; set; } = 25 * 1_048_576;
+
     /// <summary>
     /// IANA or Windows time zone the calendar tools read and write in, e.g. Australia/Sydney.
     /// Compose sets it from AGENT_TIMEZONE so the agent and the calendar agree on "today".
