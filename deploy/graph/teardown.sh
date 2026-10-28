@@ -53,5 +53,13 @@ fi
 for key in GRAPH_TENANT_ID GRAPH_CLIENT_ID GRAPH_CLIENT_SECRET GRAPH_SP_OBJECT_ID GRAPH_MAILBOX GRAPH_APP_NAME; do
   remove_env "$key"
 done
+# Deleting the app registration above also deletes its Sites.Selected role assignment and every
+# per-site grant 06-scope-drive.sh made, so only the local drive-slot records need cleaning up.
+for n in 0 1 2 3 4; do
+  remove_env "GRAPH_DRIVE_${n}_ALIAS"
+  remove_env "GRAPH_DRIVE_${n}_SITE_ID"
+  remove_env "GRAPH_DRIVE_${n}_USER"
+  remove_env "GRAPH_DRIVE_${n}_ACCESS"
+done
 disable_profile graph
 log "Removed GRAPH_* settings from $ENV_FILE"

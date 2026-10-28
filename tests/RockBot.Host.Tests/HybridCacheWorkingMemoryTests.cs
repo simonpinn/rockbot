@@ -375,6 +375,23 @@ public class HybridCacheWorkingMemoryTests
     }
 
     [TestMethod]
+    public async Task MaxEntriesPerNamespace_StashEvictsOldestInsteadOfDroppingTheNewKey()
+    {
+        _memory = CreateMemory(maxEntries: 2);
+
+        await _memory.SetAsync("stash/s1/call-a", "a");
+        await Task.Delay(5);
+        await _memory.SetAsync("stash/s1/call-b", "b");
+        await Task.Delay(5);
+        await _memory.SetAsync("stash/s1/call-c", "c");
+
+        Assert.AreEqual("c", await _memory.GetAsync("stash/s1/call-c"), "the key the model was just given must exist");
+        Assert.AreEqual("b", await _memory.GetAsync("stash/s1/call-b"));
+        Assert.IsNull(await _memory.GetAsync("stash/s1/call-a"));
+        Assert.AreEqual(2, (await _memory.ListAsync("stash/s1")).Count);
+    }
+
+    [TestMethod]
     public async Task MaxEntriesPerNamespace_DoesNotLimitDifferentNamespaces()
     {
         _memory = CreateMemory(maxEntries: 2);

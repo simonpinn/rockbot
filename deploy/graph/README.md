@@ -10,6 +10,7 @@ the only thing that holds the client secret. The agent sees these tools:
 | Mail (read-only) | `list_messages`, `search_messages`, `get_message` |
 | Calendar | `list_events`, `get_event`, `find_free_time` (read); `create_event`, `update_event`, `respond_to_event`, `delete_event` (write) |
 | Contacts | `list_contacts`, `search_contacts`, `get_contact` (read); `create_contact`, `update_contact` (write; no delete) |
+| Files (opt-in, see below) | `list_drive_items`, `get_drive_item`, `search_drive_items`, `download_drive_file` (read); `upload_drive_file`, `create_drive_folder`, `delete_drive_item` (write) |
 
 `get_message` lists a message's attachments, and `get_attachment` fetches one (up to 25 MB,
 `Graph__MaxAttachmentBytes`):
@@ -68,6 +69,51 @@ week?"*, *"Find me a free hour tomorrow"*, *"What's Alice's mobile number?"*
 - **Change mailbox:** `deploy/graph/01-create-app.sh --mailbox new@yourdomain.com && deploy/graph/02-scope-mailbox.sh`.
   The scope is updated in place.
 - **Remove everything:** `deploy/graph/teardown.sh`.
+
+## Files (OneDrive/SharePoint)
+
+Opt-in, on top of the mail/calendar/contacts setup above. Each OneDrive or SharePoint
+document library you grant is a named **alias** (e.g. `finance-ro`), never a Graph id. Tools
+take a `path` argument of the form `/{alias}/{item path}` — `/finance-ro/Budgets/2026.xlsx`, or
+just `/finance-ro` for the drive root. Tools: `list_drive_items`, `get_drive_item`,
+`search_drive_items`, `download_drive_file` (read); `upload_drive_file`, `create_drive_folder`,
+`delete_drive_item` (write; up to `Graph__MaxDriveFileBytes`, 25 MB by default).
+
+Scoping uses Graph's **Sites.Selected** application permission: the app can reach no site or
+OneDrive by default, only the ones explicitly granted, one at a time. Within that, **which
+aliases are read-only, read-write, or not reachable at all by the agent is decided by the MCP
+bridge's path-prefix argument guards** (`design/mcp-arg-guards.md`), not by this server — the
+server only knows which aliases exist and what Graph drive each resolves to.
+
+```bash
+deploy/graph/05-grant-sites-permission.sh                                    # once
+deploy/graph/06-scope-drive.sh --alias finance-ro --site-id <id> --access read
+deploy/graph/06-scope-drive.sh --alias jdoe-onedrive --user jdoe@yourdomain.com --access write
+deploy/graph/07-enable-drives.sh                                             # after any 06- change
+```
+
+`07-enable-drives.sh` rebuilds the full `argGuards` list on the `graph-mail` mcp.json entry from
+every alias `06-scope-drive.sh` has recorded, for example:
+
+```json
+"argGuards": [
+  { "handler": "path-prefix",
+    "tools": ["list_drive_items","get_drive_item","download_drive_file","search_drive_items"],
+    "options": { "args": ["path"], "allowedPrefixes": ["/finance-ro","/jdoe-onedrive"], "requireArgs": true } },
+  { "handler": "path-prefix",
+    "tools": ["upload_drive_file","create_drive_folder","delete_drive_item"],
+    "options": { "args": ["path"], "allowedPrefixes": ["/jdoe-onedrive"], "requireArgs": true } }
+]
+```
+
+Here `finance-ro` is read-only (listed only on the read-tools guard) and `jdoe-onedrive` is
+read-write (listed on both). An alias configured on the server but never recorded by
+`06-scope-drive.sh` has no access at all: the guard rejects any path outside its allowed
+prefixes, fail-closed.
+
+Up to 5 aliases (`docker-compose.yml`'s fixed `Graph__Drives__0..4__*` slots); re-running
+`06-scope-drive.sh --alias NAME ...` with the same alias updates its access level and site grant
+in place rather than adding a duplicate.
 
 ## Notes
 

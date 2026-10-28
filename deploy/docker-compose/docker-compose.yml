@@ -210,6 +210,20 @@ services:
       Graph__ClientSecret: ${GRAPH_CLIENT_SECRET:-}
       Graph__Mailbox: ${GRAPH_MAILBOX:-}
       Graph__TimeZone: ${AGENT_TIMEZONE:-America/Chicago}
+      # OneDrive/SharePoint drives, up to 5 (opt-in: deploy/graph/06-scope-drive.sh). An unused
+      # slot binds as an empty alias and McpServer.Graph drops it at startup; which aliases are
+      # read-only, read-write or unreachable is decided by the argGuards 07-enable-drives.sh adds
+      # to the agent's mcp.json, not by anything here.
+      Graph__Drives__0__Alias: ${GRAPH_DRIVE_0_ALIAS:-}
+      Graph__Drives__0__SiteId: ${GRAPH_DRIVE_0_SITE_ID:-}
+      Graph__Drives__1__Alias: ${GRAPH_DRIVE_1_ALIAS:-}
+      Graph__Drives__1__SiteId: ${GRAPH_DRIVE_1_SITE_ID:-}
+      Graph__Drives__2__Alias: ${GRAPH_DRIVE_2_ALIAS:-}
+      Graph__Drives__2__SiteId: ${GRAPH_DRIVE_2_SITE_ID:-}
+      Graph__Drives__3__Alias: ${GRAPH_DRIVE_3_ALIAS:-}
+      Graph__Drives__3__SiteId: ${GRAPH_DRIVE_3_SITE_ID:-}
+      Graph__Drives__4__Alias: ${GRAPH_DRIVE_4_ALIAS:-}
+      Graph__Drives__4__SiteId: ${GRAPH_DRIVE_4_SITE_ID:-}
 
   # Trello boards, lists and cards: read, create, update, move and comment; no archive or delete
   # (opt-in: COMPOSE_PROFILES=trello). Set up with deploy/trello/setup.sh. Only this container
@@ -408,6 +422,7 @@ services:
       - blazor
     ports:
       - "443:443"
+      - "8090:443"
     environment:
       RB_PUBLIC_HOST: ${RB_PUBLIC_HOST:-}
       AZURE_SUBSCRIPTION_ID: ${CADDY_AZURE_SUBSCRIPTION_ID:-}

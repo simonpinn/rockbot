@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -56,6 +57,31 @@ public sealed class GraphApi(HttpClient http, IOptions<GraphMailOptions> options
         }
     }
 
+    /// <summary>PUTs raw bytes (e.g. a small file upload) and returns the response document, or null for an empty reply.</summary>
+    public async Task<JsonDocument?> PutBytesAsync(string relativeUri, byte[] content, string contentType, string feature, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Put, relativeUri) { Content = new ByteArrayContent(content) };
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await http.SendAsync(request, ct);
+        }
+        catch (AuthenticationFailedException ex)
+        {
+            throw new McpException($"could not authenticate to Microsoft Graph; check the GRAPH_* settings: {ex.Message}", ex);
+        }
+
+        using (response)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct);
+            if (!response.IsSuccessStatusCode)
+                throw new McpException(DescribeFailure(response.StatusCode, body, feature));
+            return string.IsNullOrWhiteSpace(body) ? null : JsonDocument.Parse(body);
+        }
+    }
+
     /// <summary>GETs raw bytes (e.g. an attachment's <c>$value</c>), refusing bodies over <paramref name="maxBytes"/>.</summary>
     public async Task<byte[]> GetBytesAsync(string relativeUri, string feature, long maxBytes, CancellationToken ct)
     {
@@ -105,6 +131,8 @@ public sealed class GraphApi(HttpClient http, IOptions<GraphMailOptions> options
 
         var hint = status switch
         {
+            HttpStatusCode.Forbidden when feature == "files" =>
+                " The app is not authorised for this drive. Run deploy/graph/05-scope-drives.sh to grant it Sites.Selected access.",
             HttpStatusCode.Forbidden => $" The app is not authorised for {feature} on this mailbox. If the Exchange role assignment " +
                                         "was created recently it can take up to 2 hours to apply; otherwise re-run deploy/graph/setup.sh.",
             HttpStatusCode.Unauthorized => " The Graph token was rejected; check the client secret has not expired.",

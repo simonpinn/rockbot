@@ -105,7 +105,28 @@ internal sealed class HybridCacheWorkingMemory : IWorkingMemory
             GetNamespace(kvp.Key).Equals(ns, StringComparison.OrdinalIgnoreCase) &&
             kvp.Value.ExpiresAt > now);
 
-        if (!_index.ContainsKey(key) && nsCount >= _options.MaxEntriesPerNamespace)
+        if (!_index.ContainsKey(key) && nsCount >= _options.MaxEntriesPerNamespace && IsEvictableKey(key))
+        {
+            // Stash entries are recoverable copies of trimmed tool results, and the trimmer has
+            // already told the model the new key exists. Dropping the newest write would hand the
+            // model a dead key — it then re-runs the tool to see the result, over and over — so
+            // the oldest stash entries make room instead.
+            var oldest = _index
+                .Where(kvp => GetNamespace(kvp.Key).Equals(ns, StringComparison.OrdinalIgnoreCase) && kvp.Value.ExpiresAt > now)
+                .OrderBy(kvp => kvp.Value.StoredAt)
+                .Take(nsCount - _options.MaxEntriesPerNamespace + 1)
+                .Select(kvp => kvp.Key)
+                .ToList();
+            foreach (var evicted in oldest)
+            {
+                _index.TryRemove(evicted, out _);
+                _embeddings.TryRemove(evicted, out _);
+                _cache.Remove(CacheKey(evicted));
+            }
+            _logger.LogDebug("Working memory namespace '{Namespace}' full; evicted {Count} oldest stash entries for '{Key}'",
+                ns, oldest.Count, key);
+        }
+        else if (!_index.ContainsKey(key) && nsCount >= _options.MaxEntriesPerNamespace)
         {
             _logger.LogWarning(
                 "Working memory limit reached for namespace '{Namespace}' ({Max} entries); ignoring key '{Key}'",
@@ -375,6 +396,10 @@ internal sealed class HybridCacheWorkingMemory : IWorkingMemory
     /// </summary>
     private static bool IsEphemeralKey(string key) =>
         key.StartsWith("wisp/", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Keys whose namespace keeps the newest entries when full, rather than refusing new ones.</summary>
+    private static bool IsEvictableKey(string key) =>
+        key.StartsWith("stash/", StringComparison.OrdinalIgnoreCase);
 
     private static bool PassesStructuralFilters(WorkingMemoryEntry entry, MemorySearchCriteria criteria)
     {

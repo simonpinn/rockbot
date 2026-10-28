@@ -167,17 +167,23 @@ public sealed class MailToolsTests : GraphServerTestBase
         [
             "get_message", "list_messages", "search_messages", "get_attachment",
             "list_events", "get_event", "find_free_time",
-            "list_contacts", "search_contacts", "get_contact"
+            "list_contacts", "search_contacts", "get_contact",
+            "list_drive_items", "get_drive_item", "search_drive_items", "download_drive_file"
         ];
-        string[] writes = ["create_event", "update_event", "delete_event", "respond_to_event", "create_contact", "update_contact"];
+        string[] writes =
+        [
+            "create_event", "update_event", "delete_event", "respond_to_event", "create_contact", "update_contact",
+            "upload_drive_file", "create_drive_folder", "delete_drive_item"
+        ];
         CollectionAssert.AreEquivalent(readOnly.Concat(writes).ToArray(), tools.Select(t => t.Name).ToArray());
 
+        string[] destructive = ["delete_event", "delete_drive_item"];
         foreach (var tool in tools)
         {
             var annotations = tool.ProtocolTool.Annotations;
             Assert.AreEqual(readOnly.Contains(tool.Name), annotations?.ReadOnlyHint ?? false, $"{tool.Name} read-only hint");
             if (!readOnly.Contains(tool.Name))
-                Assert.AreEqual(tool.Name == "delete_event", annotations?.DestructiveHint ?? true, $"{tool.Name} destructive hint");
+                Assert.AreEqual(destructive.Contains(tool.Name), annotations?.DestructiveHint ?? true, $"{tool.Name} destructive hint");
             Assert.IsFalse(tool.JsonSchema.GetProperty("additionalProperties").GetBoolean(), tool.Name);
         }
     }

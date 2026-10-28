@@ -23,4 +23,15 @@ public sealed class GraphMailOptions
     /// Compose sets it from AGENT_TIMEZONE so the agent and the calendar agree on "today".
     /// </summary>
     [Required] public string TimeZone { get; set; } = "UTC";
+
+    /// <summary>
+    /// OneDrive/SharePoint drives the Drive tools can reach. Empty by default — Files access is
+    /// opt-in. Which aliases are read-only, read-write or unreachable is decided outside this
+    /// server entirely, by the MCP bridge's path-prefix argument guards (see deploy/graph/README.md);
+    /// this list only says which aliases exist and which Graph drive each one resolves to.
+    /// </summary>
+    public List<GraphDriveEntry> Drives { get; set; } = [];
+
+    /// <summary>Largest file download_drive_file and upload_drive_file will move in one call.</summary>
+    [Range(1_024, 157_286_400)] public long MaxDriveFileBytes { get; set; } = 25 * 1_048_576;
 }

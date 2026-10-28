@@ -26,6 +26,9 @@ public abstract class GraphServerTestBase
 
     protected FakeGraphHandler Graph { get; } = new();
 
+    /// <summary>Extra "Graph:..." settings a derived test class needs, e.g. Drive aliases.</summary>
+    protected virtual IReadOnlyDictionary<string, string?> ExtraSettings { get; } = new Dictionary<string, string?>();
+
     protected async Task<McpClient> ClientAsync()
     {
         if (_client is not null)
@@ -39,6 +42,8 @@ public abstract class GraphServerTestBase
             b.UseSetting("Graph:Mailbox", Mailbox);
             b.UseSetting("Graph:MaxBodyChars", "1000");
             b.UseSetting("Graph:TimeZone", TimeZone);
+            foreach (var (key, value) in ExtraSettings)
+                b.UseSetting(key, value);
             b.ConfigureTestServices(services =>
             {
                 services.AddSingleton<TokenCredential>(new StubCredential());
