@@ -320,8 +320,8 @@ public class WispExecutionLogTests
     public void ComputeDefinitionHash_SameInput_SameHash()
     {
         var json = """{"description":"test","steps":[]}""";
-        var hash1 = SpawnWispsExecutor.ComputeDefinitionHash(json);
-        var hash2 = SpawnWispsExecutor.ComputeDefinitionHash(json);
+        var hash1 = WispReplayPipeline.ComputeDefinitionHash(json);
+        var hash2 = WispReplayPipeline.ComputeDefinitionHash(json);
 
         Assert.AreEqual(hash1, hash2);
         Assert.AreEqual(16, hash1.Length);
@@ -330,8 +330,8 @@ public class WispExecutionLogTests
     [TestMethod]
     public void ComputeDefinitionHash_DifferentInput_DifferentHash()
     {
-        var hash1 = SpawnWispsExecutor.ComputeDefinitionHash("""{"a":1}""");
-        var hash2 = SpawnWispsExecutor.ComputeDefinitionHash("""{"a":2}""");
+        var hash1 = WispReplayPipeline.ComputeDefinitionHash("""{"a":1}""");
+        var hash2 = WispReplayPipeline.ComputeDefinitionHash("""{"a":2}""");
 
         Assert.AreNotEqual(hash1, hash2);
     }

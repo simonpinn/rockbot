@@ -251,7 +251,7 @@ public class WispTypedMcpTests
 
         Assert.AreEqual("calendar-mcp", shorthand.Steps[0].Server);
         Assert.AreEqual("get_events", shorthand.Steps[0].Tool);
-        Assert.AreEqual(SpawnWispsExecutor.ComputeShapeHash(longForm), SpawnWispsExecutor.ComputeShapeHash(shorthand));
+        Assert.AreEqual(WispReplayPipeline.ComputeShapeHash(longForm), WispReplayPipeline.ComputeShapeHash(shorthand));
     }
 
     [TestMethod]

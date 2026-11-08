@@ -28,7 +28,7 @@ A second, related gap: `skill-asset-promotion.md` Phase 5 treats a failing provi
 
 ```
 Skill store (validated, Wisp-typed SkillResource)
-        │ watches
+        │ polled each reconciliation cycle (no change-notification exists)
         ▼
  ReflexToolCatalog ──builds──> ToolRegistration + ReflexExecutor
         │                              │
@@ -80,22 +80,28 @@ Two independent fixes against real, already-traced code — no new directive fil
 
 ### Where
 
-New project `src/RockBot.Tools.Reflex/`, sibling to `src/RockBot.Tools.Mcp/`.
+New project `src/RockBot.Tools.Reflex/`, sibling to `src/RockBot.Tools.Mcp/` (one new `<Project Path="...">` line in `RockBot.slnx`). Also touches `src/RockBot.Wisp/SpawnWispsExecutor.cs` (extraction — see below) and `src/RockBot.Tools.Mcp/McpServerNames.cs` (reserved name).
 
 ### Change
 
-`ReflexToolCatalog` watches `ISkillStore`. For every validated (`Provisional=false`), `Wisp`-typed resource, it builds a `ToolRegistration` — name `reflex__{namespace}__{resource}`, schema from the wisp's declared parameters — and a `ReflexExecutor`, then calls `IToolRegistry.Register`, the same in-process path `WispToolRegistrar`/`DreamCostToolRegistrar` already use. `"reflex"` becomes a reserved word no MCP server name may use, so the two naming schemes can never collide (MCP server names already can't contain `__`).
+The original sketch of this phase assumed several things that turned out not to exist when checked against the actual code — corrected here rather than discovered mid-implementation, the same way Phase 1's review caught `SkillResourceApplier` needing a real change instead of none:
 
-The moment a resource stops being validated — demoted back to provisional by Phase 1's repair path, or deleted — the catalog unregisters its tool and evicts it from every session holding it active or pinned, reusing the eviction hook `McpWrapperCatalog` already has for a vanished or changed MCP tool.
-
-`ReflexExecutor` looks up the stored wisp body and replays it through the existing wisp runner — the same one `spawn_wisps` uses. It must keep emitting the `(skillName, filename, succeeded)` event the Phase 1 repair/validation read-path depends on: bypassing fetch-then-spawn must not also bypass the instrumentation that keeps the trust gradient honest. In-flight calls lease their executor snapshot (mirroring `McpServerConnections`' lease pattern), so a concurrent demotion can't invalidate a call already running — the demotion takes effect on the next call instead. Invocations are tagged `via=reflex` in the existing tool-invocation metrics, the same way MCP calls are already tagged `via=wrapper|invoke_tool`.
+- **Reconciliation is a timer, not a watch.** `ISkillStore` has no change-notification of any kind — there is nothing to "watch." `ReflexToolCatalog` is its own `IHostedService` running a periodic reconciliation loop. Each cycle: list all skills, scan manifests for validated (`Provisional=false`), `Wisp`-typed resources, diff against what's currently registered, `Register`/`Unregister` the delta — structurally the same diff-and-swap `McpWrapperCatalog` already does for MCP tools, just timer-triggered instead of triggered by its `McpServersIndexed` message. `WispToolRegistrar`/`DreamCostToolRegistrar` are *not* the precedent here despite the original wording — each registers one static tool exactly once, forever, and never reconciles a changing set. `McpWrapperCatalog` is the only existing precedent for dynamic multi-tool registration in this codebase, and this phase mirrors it.
+- **No schema exists yet — reflexes ship as zero-argument tools in this phase.** `SkillResource` carries no parameter schema, and a wisp's steps are literal `JsonElement`s fixed at authoring time with no external input point. "Schema from the wisp's declared parameters" didn't correspond to anything real. `ToolRegistration.ParametersSchema` is an empty-object schema here — a reflex in this phase is a named, zero-argument replay of a fixed pipeline. Accepting caller-supplied parameters would mean extending the wisp step format itself; that's out of scope, the same boundary as the existing "not changing wisp execution" non-goal, not something this phase assumes.
+- **Eviction moves to Phase 3 — there's nothing to evict from yet.** `McpTypedToolSurface.Evict` (the hook the original sketch said to reuse) removes tool names from a *session's* active/pinned list — but that per-session activation list is `ReflexToolSurface`, which doesn't exist until Phase 3. This phase cannot evict from a structure that isn't built yet. Scoped down: on demote/delete, `ReflexToolCatalog` only unregisters via `IToolRegistry.Unregister`. A registered reflex is visible to every session immediately (the same unscoped visibility `WispToolRegistrar`'s/`DreamCostToolRegistrar`'s tools already have) until Phase 3 wraps registration with session-level activation/pinning/eviction, without changing this phase's registration contract.
+- **Replay reuses the runner, but the runner's logging path is private — it needs extracting, not just calling.** The `(skillName, filename, succeeded)`-shaped event Phase 1 depends on is actually a `WispExecutionRecord` appended via `IWispExecutionLog.AppendAsync`; building one (canonicalize → hash → circuit-breaker check → `WispExecutor.ExecuteAsync` → log) happens entirely inside `SpawnWispsExecutor`'s private `ExecuteOneAsync`/`LogExecutionAsync`. This phase extracts that pipeline into a method both `SpawnWispsExecutor` and the new `ReflexExecutor` call — a real change to an existing file, not a "reused as-is" dependency.
+- **No lease/ref-count machinery — a cheaper pattern already fits.** `McpServerConnections`' lease pattern exists because a live server connection is a genuinely shared, disposable resource; nothing in `ReflexExecutor` is. `McpWrapperCatalog` gets the same "an in-flight call is immune to a concurrent registry change" guarantee for free, just by reading one immutable record out of a `volatile`-swapped dictionary at the start of a call and using that local copy for the rest of it. `ReflexExecutor` does the same — no lease, no release, no disposal.
+- **No `via=reflex` tag — the existing name tag already disambiguates for free.** `via=wrapper|invoke_tool` lives only on `McpDiagnostics`' MCP-specific counter — not the right place for a reflex call regardless. The generic, cross-backend counter (`ToolDiagnostics.Invocations`/`InvokeDuration`, tagged today by `rockbot.tool.name`/`rockbot.tool.status` at four call sites across `AgentLoopRunner.cs` and `RockBotFunctionInvokingChatClient.cs`) has no source/backend tag, and adding one would mean injecting `IToolRegistry` into both of those classes — two of the most heavily used and heavily tested components in the host — just to resolve a tag already implied by the tool's own name. Every reflex tool's name already starts with `reflex__`, so cost analysis (the feature's original motivation) is a `rockbot.tool.name` prefix filter away, at zero new risk. Not worth the blast radius for what the prefix already gives for free; revisit only if a real dashboard need shows the prefix filter is insufficient.
+- **Reserved-name enforcement has a confirmed home.** `McpServerNames.Validate` already rejects server names containing the `__` separator; this phase adds one more check there rejecting the literal name `"reflex"`, closing the one real collision risk (an MCP server named exactly `reflex` producing tool names that share reflex's own prefix).
 
 ### Acceptance
 
-- A validated Wisp resource is registered as a callable tool within one reconciliation cycle.
-- A demoted-to-provisional or deleted resource is unregistered and evicted from every session holding it active or pinned.
-- A direct reflex call still records the validation event; a reflex call appears in metrics tagged `via=reflex`.
-- A demotion racing an in-flight call does not fail the call in progress.
+- A validated Wisp resource is registered as a callable tool within one reconciliation cycle; its schema takes no arguments.
+- A demoted-to-provisional or deleted resource is unregistered from `IToolRegistry` within one reconciliation cycle. (Session-level eviction is Phase 3's acceptance criterion, not this phase's — there is no session activation list yet.)
+- A direct reflex call still appends a `WispExecutionRecord` via the same path `spawn_wisps` uses, so Phase 1's repair/validation read-path sees it exactly as if it had gone through fetch-then-spawn.
+- A reflex call's invocation appears in the generic tool-invocation metrics tagged `rockbot.tool.name=reflex__...` like any other registered tool — already filterable by name prefix, no new tag needed.
+- A reconciliation cycle racing an in-flight call does not fail the call in progress — it completes against the snapshot it started with.
+- An MCP server cannot be registered with the literal name `reflex`.
 
 ## Phase 3 — `ReflexToolSurface` (lazy activation, namespace pinning)
 
@@ -148,6 +154,7 @@ Suggested order: **1 → 2 → 3 → 4.** Phase 1 alone improves every existing 
 - **Namespace pin granularity.** Skill namespaces vary in size; pinning a large one could fill the activation budget in one step. Mitigation: the activation budget (40) caps the total regardless of how a namespace pin fills it; revisit the namespace-pin-count default (3) empirically once real usage data exists, the way `worker-subagents.md` treats its own defaults.
 - **Two independent LRU/pin systems to reason about** (MCP's and reflexes'). Mitigation: kept deliberately structurally identical so the mental model transfers directly; revisit merging only if usage shows no cross-pressure risk.
 - **Reserved-word collision.** `"reflex"` as a reserved MCP-server-name prefix needs enforcement at server registration time, not just at reflex-tool naming time, or a future `mcp_register_server` call could create an ambiguous name.
+- **Zero-argument-only reflexes.** Phase 2 ships reflexes that take no arguments (no schema exists today to do otherwise — see Phase 2's "Change"). A fixed, parameterless replay is still real value for the patterns that fit it, but it undersells what "callable tool" suggests to a reader expecting arguments. Parameterizing reflexes would mean extending the wisp step format itself — a genuinely separate, larger change, not assumed here or scheduled into Phase 4's scope without a fresh look.
 
 ## Migration
 

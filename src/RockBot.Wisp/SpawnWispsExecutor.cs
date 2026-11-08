@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -111,10 +110,7 @@ internal sealed class SpawnWispsExecutor(
 
             // Typed-name shorthand becomes server + tool before hashing, so the definition hash,
             // shape hash and stored body don't depend on which form the author wrote (#647).
-            definition = McpStepResolver.CanonicalizeShorthand(definition, mcpToolDirectory);
-            var defJson = JsonSerializer.Serialize(definition, JsonOptions);
-            var defHash = ComputeDefinitionHash(defJson);
-            var shapeHash = ComputeShapeHash(definition);
+            var prepared = WispReplayPipeline.Prepare(definition, mcpToolDirectory);
 
             // Circuit breaker: refuse to run a wisp whose exact definition has been
             // dispatched too many times in the recent window. This is the only guard
@@ -122,28 +118,14 @@ internal sealed class SpawnWispsExecutor(
             // the per-loop repetitive-call detector cannot see across them. A tripped
             // dispatch does NO work (no LLM, no tool calls) and is NOT written to the
             // execution log, so a runaway collapses into a cheap, self-limiting error
-            // instead of an unbounded spin. The refusal message is intentionally stable
-            // (no counts/ids) so the agent-loop's repetitive-result detector also sees
-            // it as identical and nudges the model off the loop.
-            if (circuitBreaker is not null)
-            {
-                var decision = circuitBreaker.Admit(defHash);
-                if (!decision.Allowed)
-                {
-                    logger.LogWarning(
-                        "Wisp dispatch circuit breaker tripped for definition {DefHash} ('{Description}'): " +
-                        "{Count} dispatches within {WindowMinutes:F0}m (limit {Limit}). Refusing to run; session={Session}.",
-                        defHash, definition.Description, decision.Count, decision.Window.TotalMinutes,
-                        options.DispatchCircuitBreakerMaxPerWindow, sessionId ?? "(none)");
-                    WispDiagnostics.CircuitBreakerTrips.Add(1);
-                    return BuildCircuitBreakerResult(wispId, definition);
-                }
-            }
-
-            var result = await wispExecutor.ExecuteAsync(definition, wispId, parentSessionId: sessionId, ct);
+            // instead of an unbounded spin.
+            var (result, tripped) = await WispReplayPipeline.RunAsync(
+                wispExecutor, prepared, wispId, parentSessionId: sessionId, circuitBreaker, logger, ct);
+            if (tripped)
+                return result;
 
             // Log execution (fire-and-forget, don't block the batch)
-            _ = LogExecutionAsync(result, defHash, shapeHash, defJson, batchId, sessionId, ct);
+            _ = LogExecutionAsync(result, prepared.DefinitionHash, prepared.ShapeHash, prepared.DefinitionJson, batchId, sessionId, ct);
 
             return result;
         }
@@ -400,39 +382,6 @@ internal sealed class SpawnWispsExecutor(
         }
     }
 
-    /// <summary>
-    /// Builds the synthetic failed result returned when the circuit breaker refuses a
-    /// dispatch. The error message is stable (no counts or ids) so identical refusals
-    /// look identical to the agent-loop's repetitive-result detector, which then nudges
-    /// the model to stop. Categorised <see cref="FailureCategory.External"/> — the wisp
-    /// definition itself isn't malformed; it's being dispatched too aggressively.
-    /// </summary>
-    private static WispExecutionResult BuildCircuitBreakerResult(string wispId, WispDefinition definition) =>
-        new()
-        {
-            WispId = wispId,
-            IsSuccess = false,
-            Duration = TimeSpan.Zero,
-            Definition = definition,
-            StepResults =
-            [
-                new WispStepResult
-                {
-                    StepId = "circuit-breaker",
-                    StepIndex = 0,
-                    IsSuccess = false,
-                    Duration = TimeSpan.Zero,
-                    Error = new WispStepError
-                    {
-                        Category = FailureCategory.External,
-                        Message = "Circuit breaker: this exact wisp definition has been dispatched too many " +
-                                  "times in a short window and is temporarily blocked. Stop re-running it — " +
-                                  "fix the underlying problem or take a different approach."
-                    }
-                }
-            ]
-        };
-
     private static IReadOnlyList<WispDefinition>? ParseDefinitions(
         Dictionary<string, JsonElement> args, out string? error)
     {
@@ -502,62 +451,6 @@ internal sealed class SpawnWispsExecutor(
             error = $"Invalid wisp definition: {ex.Message}";
             return null;
         }
-    }
-
-    internal static string ComputeDefinitionHash(string definitionJson)
-    {
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(definitionJson));
-        return Convert.ToHexStringLower(bytes)[..16];
-    }
-
-    /// <summary>
-    /// Hash the structural shape of a wisp — gateway/server/tool/mode plus the
-    /// sorted set of parameter keys per step — while stripping description,
-    /// prompt text, and literal parameter values. Two wisps that differ only by
-    /// description or by date/accountId values share the same shape hash, so
-    /// the success-promotion pass can group repeated patterns that the LLM
-    /// authored as cosmetically distinct invocations.
-    /// </summary>
-    internal static string ComputeShapeHash(WispDefinition definition)
-    {
-        var canonical = new
-        {
-            steps = definition.Steps.Select(s => new
-            {
-                id = s.Id,
-                mode = s.Mode.ToString(),
-                gateway = s.Gateway?.ToString(),
-                server = s.Server,
-                tool = s.Tool,
-                language = s.Language,
-                agent = s.Agent,
-                skill = s.Skill,
-                hasPrompt = !string.IsNullOrEmpty(s.Prompt),
-                hasMessage = !string.IsNullOrEmpty(s.Message),
-                paramKeys = ExtractParamKeys(s.ResolvedParams),
-                metadataKeys = ExtractParamKeys(s.Metadata),
-                hasInputFrom = !string.IsNullOrEmpty(s.InputFrom),
-                hasOutputTo = !string.IsNullOrEmpty(s.OutputTo),
-                onFailure = s.OnFailure?.Action.ToString()
-            }).ToList()
-        };
-
-        var json = JsonSerializer.Serialize(canonical, JsonOptions);
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(json));
-        return Convert.ToHexStringLower(bytes)[..16];
-    }
-
-    private static IReadOnlyList<string> ExtractParamKeys(JsonElement? element)
-    {
-        if (element is null || element.Value.ValueKind != JsonValueKind.Object)
-            return [];
-
-        var keys = new List<string>();
-        foreach (var prop in element.Value.EnumerateObject())
-            keys.Add(prop.Name);
-
-        keys.Sort(StringComparer.Ordinal);
-        return keys;
     }
 
     /// <summary>
