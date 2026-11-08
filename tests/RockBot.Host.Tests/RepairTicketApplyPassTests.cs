@@ -320,6 +320,186 @@ public class RepairTicketApplyPassTests
         Assert.IsNull(await wm.GetAsync("claim/capability/svr/x"));
     }
 
+    // ── SkillResource (reflex-tools Phase 1 retrain-before-delete lifecycle) ───
+
+    [TestMethod]
+    public async Task SkillResourceTicket_DemoteProvisional_VerifySucceeds_RestampsCreatedAtAndResolves()
+    {
+        var store = NewStore();
+        var skillStore = new InMemorySkillResourceStore();
+        var oldCreatedAt = DateTimeOffset.UtcNow.AddDays(-10);
+        await skillStore.SaveAsync(new Skill("calendar/scan", "Scan", "# Scan", DateTimeOffset.UtcNow));
+        await skillStore.AttachResourceAsync(
+            "calendar/scan",
+            new SkillResourceInput("fanout.json", SkillResourceType.Wisp, "x", "{}"),
+            new SkillResource("fanout.json", SkillResourceType.Wisp, "x",
+                Provisional: true, CreatedAt: oldCreatedAt));
+
+        await store.SaveAsync(NewSkillResourceTicket("t-1", "calendar/scan", "fanout.json", "demote-provisional"));
+
+        var appliers = AppliersWith(new SkillResourceApplier(skillStore, NullLogger<SkillResourceApplier>.Instance));
+        var verifier = StubVerifier.WithOutcomes(VerifyOutcome.PredicateSucceeded);
+        var before = DateTimeOffset.UtcNow;
+
+        await DreamService.RunRepairTicketApplyAsync(
+            store, appliers, verifier, workingMemory: null,
+            new RepairTicketOptions(), NullLogger.Instance, CancellationToken.None);
+
+        var ticket = await store.GetAsync("t-1");
+        Assert.AreEqual(RepairStatus.Resolved, ticket!.Status);
+
+        var entry = (await skillStore.GetAsync("calendar/scan"))!.Manifest!.Single(r => r.Filename == "fanout.json");
+        Assert.IsTrue(entry.Provisional);
+        Assert.IsTrue(entry.CreatedAt >= before,
+            "demote-provisional must restamp CreatedAt through the full ticket lifecycle, or the retrain is a no-op and the resource stays stuck (the Critical bug this plan's review caught).");
+    }
+
+    [TestMethod]
+    public async Task SkillResourceTicket_Delete_VerifyFails_AutoRevertedRestoresResource()
+    {
+        var store = NewStore();
+        var skillStore = new InMemorySkillResourceStore();
+        await skillStore.SaveAsync(new Skill("calendar/scan", "Scan", "# Scan", DateTimeOffset.UtcNow));
+        await skillStore.AttachResourceAsync(
+            "calendar/scan",
+            new SkillResourceInput("fanout.json", SkillResourceType.Wisp, "x", "{}"),
+            new SkillResource("fanout.json", SkillResourceType.Wisp, "x", Provisional: true));
+
+        await store.SaveAsync(NewSkillResourceTicket("t-1", "calendar/scan", "fanout.json", "delete"));
+
+        var appliers = AppliersWith(new SkillResourceApplier(skillStore, NullLogger<SkillResourceApplier>.Instance));
+        // A verify that fails auto-reverts the delete — the exact mechanism the
+        // directive's SkillResource verify guidance exists to steer away from
+        // (never pick a verify whose success depends on the resource you just
+        // removed).
+        var verifier = StubVerifier.AlwaysFails;
+
+        await DreamService.RunRepairTicketApplyAsync(
+            store, appliers, verifier, workingMemory: null,
+            new RepairTicketOptions { MaxAttempts = 3 }, NullLogger.Instance, CancellationToken.None);
+
+        var skill = await skillStore.GetAsync("calendar/scan");
+        Assert.IsTrue(skill!.Manifest!.Any(r => r.Filename == "fanout.json"),
+            "A failing verify must auto-revert the delete, restoring the resource.");
+    }
+
+    [TestMethod]
+    public async Task SkillResourceTicket_VerifySucceeds_IncrementsResolvedCounter_NotEscalated()
+    {
+        var store = NewStore();
+        var skillStore = new InMemorySkillResourceStore();
+        await skillStore.SaveAsync(new Skill("calendar/scan", "Scan", "# Scan", DateTimeOffset.UtcNow));
+        await skillStore.AttachResourceAsync(
+            "calendar/scan",
+            new SkillResourceInput("fanout.json", SkillResourceType.Wisp, "x", "{}"),
+            new SkillResource("fanout.json", SkillResourceType.Wisp, "x", Provisional: true));
+        await store.SaveAsync(NewSkillResourceTicket("t-1", "calendar/scan", "fanout.json", "demote-provisional"));
+
+        var appliers = AppliersWith(new SkillResourceApplier(skillStore, NullLogger<SkillResourceApplier>.Instance));
+        var verifier = StubVerifier.WithOutcomes(VerifyOutcome.PredicateSucceeded);
+        var (resolved, escalated) = CountSkillResourceCounters(async () =>
+            await DreamService.RunRepairTicketApplyAsync(
+                store, appliers, verifier, workingMemory: null,
+                new RepairTicketOptions(), NullLogger.Instance, CancellationToken.None));
+
+        Assert.AreEqual(1, resolved);
+        Assert.AreEqual(0, escalated);
+    }
+
+    [TestMethod]
+    public async Task SkillResourceTicket_VerifyFailsThreeTimes_IncrementsEscalatedCounterOnce()
+    {
+        var store = NewStore();
+        var skillStore = new InMemorySkillResourceStore();
+        await skillStore.SaveAsync(new Skill("calendar/scan", "Scan", "# Scan", DateTimeOffset.UtcNow));
+        await skillStore.AttachResourceAsync(
+            "calendar/scan",
+            new SkillResourceInput("fanout.json", SkillResourceType.Wisp, "x", "{}"),
+            new SkillResource("fanout.json", SkillResourceType.Wisp, "x", Provisional: true));
+        await store.SaveAsync(NewSkillResourceTicket("t-1", "calendar/scan", "fanout.json", "demote-provisional"));
+
+        var appliers = AppliersWith(new SkillResourceApplier(skillStore, NullLogger<SkillResourceApplier>.Instance));
+        var verifier = StubVerifier.AlwaysFails;
+        var options = new RepairTicketOptions { MaxAttempts = 3 };
+
+        var (resolved, escalated) = CountSkillResourceCounters(async () =>
+        {
+            for (var i = 0; i < 3; i++)
+            {
+                await DreamService.RunRepairTicketApplyAsync(
+                    store, appliers, verifier, workingMemory: null, options,
+                    NullLogger.Instance, CancellationToken.None);
+            }
+        });
+
+        Assert.AreEqual(0, resolved);
+        Assert.AreEqual(1, escalated, "only the final cycle's transition into Escalated should count, not every Open cycle");
+    }
+
+    [TestMethod]
+    public async Task SkillBodyTicket_VerifySucceeds_DoesNotIncrementSkillResourceCounters()
+    {
+        var store = NewStore();
+        var skillStore = new SkillBodyApplierTests.InMemorySkillStore();
+        await skillStore.SaveAsync(new Skill("calendar/foo", "s", "Original body.\n", DateTimeOffset.UtcNow));
+        await store.SaveAsync(NewSkillTicket("t-1", "calendar/foo"));
+
+        var appliers = AppliersWith(new SkillBodyApplier(skillStore, NullLogger<SkillBodyApplier>.Instance));
+        var verifier = StubVerifier.WithOutcomes(VerifyOutcome.PredicateSucceeded);
+
+        var (resolved, escalated) = CountSkillResourceCounters(async () =>
+            await DreamService.RunRepairTicketApplyAsync(
+                store, appliers, verifier, workingMemory: null,
+                new RepairTicketOptions(), NullLogger.Instance, CancellationToken.None));
+
+        Assert.AreEqual(0, resolved, "a SkillBody ticket resolving must not count toward the SkillResource-specific metric");
+        Assert.AreEqual(0, escalated);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="act"/> while counting emissions on
+    /// <see cref="HostDiagnostics.RepairSkillResourceResolved"/> and
+    /// <see cref="HostDiagnostics.RepairSkillResourceEscalated"/>.
+    /// </summary>
+    private static (long Resolved, long Escalated) CountSkillResourceCounters(Func<Task> act)
+    {
+        long resolved = 0, escalated = 0;
+        using var listener = new System.Diagnostics.Metrics.MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (ReferenceEquals(instrument, HostDiagnostics.RepairSkillResourceResolved)
+                || ReferenceEquals(instrument, HostDiagnostics.RepairSkillResourceEscalated))
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>((instrument, value, _, _) =>
+        {
+            if (ReferenceEquals(instrument, HostDiagnostics.RepairSkillResourceResolved))
+                Interlocked.Add(ref resolved, value);
+            else if (ReferenceEquals(instrument, HostDiagnostics.RepairSkillResourceEscalated))
+                Interlocked.Add(ref escalated, value);
+        });
+        listener.Start();
+
+        act().GetAwaiter().GetResult();
+
+        return (resolved, escalated);
+    }
+
+    private static RepairTicket NewSkillResourceTicket(string id, string skillName, string filename, string op) =>
+        new(
+            Id: id,
+            PatternKey: $"skill-resource|{skillName}|{filename}",
+            Target: RepairTarget.SkillResource,
+            Change: JsonDocument.Parse(
+                "{ \"skill\": \"" + skillName + "\", \"filename\": \"" + filename + "\", \"op\": \"" + op + "\" }"
+            ).RootElement,
+            Verify: new VerifyShape("svr", "tool", JsonDocument.Parse("{}").RootElement,
+                new VerifyExpectation(VerifyExpectationKind.Success)),
+            Attempts: [],
+            Status: RepairStatus.Open,
+            CreatedAt: DateTimeOffset.UtcNow,
+            UpdatedAt: DateTimeOffset.UtcNow);
+
     private static RepairAttempt FailedAttempt() =>
         new(DateTimeOffset.UtcNow,
             JsonDocument.Parse("{}").RootElement,

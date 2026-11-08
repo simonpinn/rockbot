@@ -12,8 +12,12 @@ namespace RockBot.Host;
 /// attaches are hypotheses awaiting validation by the dream-cycle pass).</item>
 /// <item><c>delete</c> — remove a resource by filename.</item>
 /// <item><c>demote-provisional</c> — flip a manifest entry's <c>Provisional=true</c>
-/// (the validation pass normally flips false; this op is the inverse, used when a
-/// resource needs to be re-validated after suspicion).</item>
+/// and restamp <c>CreatedAt</c> to now, resetting the validation window (the
+/// validation pass normally flips <c>Provisional</c> false; this op is the inverse,
+/// used when a resource needs to be re-validated after suspicion). The restamp
+/// happens even when the resource is already provisional, which is the only state
+/// the provisional-validation failure path can produce — without it the op would
+/// be a no-op for that trigger and the resource would never get a real retrain.</item>
 /// </list>
 /// Both <c>attach</c> and <c>delete</c> ship a revert callback so a verify failure can
 /// roll the change back without requiring a second LLM round-trip.
@@ -192,20 +196,13 @@ internal sealed class SkillResourceApplier : IRepairTargetApplier
             ?? throw new InvalidOperationException(
                 $"Resource '{change.Filename}' not found on skill '{change.Skill}'.");
 
-        if (priorEntry.Provisional)
-        {
-            // Already provisional — no-op, no revert needed.
-            var diffNoop = JsonSerializer.SerializeToElement(new
-            {
-                op = "demote-provisional",
-                skill = change.Skill,
-                filename = change.Filename,
-                changed = false,
-            }, JsonOptions);
-            return new RepairApplyOutcome(diffNoop, Revert: null);
-        }
-
-        var demoted = priorEntry with { Provisional = true };
+        // Always restamps CreatedAt, even when the resource is already provisional
+        // (the only state this op is ever applied to via the provisional-validation
+        // failure path): flipping Provisional true->true alone would be a no-op,
+        // which left a retrained resource stuck forever (see design/reflex-tools.md
+        // Phase 1). Restamping resets the validation window so DecideProvisionalAction
+        // stops seeing the old failing records next cycle — a real retraining action.
+        var demoted = priorEntry with { Provisional = true, CreatedAt = DateTimeOffset.UtcNow };
         var ok = await _skillStore.UpdateResourceMetadataAsync(change.Skill!, demoted);
         if (!ok)
             throw new InvalidOperationException(
@@ -217,14 +214,15 @@ internal sealed class SkillResourceApplier : IRepairTargetApplier
             skill = change.Skill,
             filename = change.Filename,
             changed = true,
+            wasAlreadyProvisional = priorEntry.Provisional,
         }, JsonOptions);
 
         Func<CancellationToken, Task> revert = async revertCt =>
         {
             await _skillStore.UpdateResourceMetadataAsync(change.Skill!, priorEntry);
             _logger.LogInformation(
-                "SkillResourceApplier reverted demote: restored Provisional=false on '{File}' for skill '{Skill}'",
-                change.Filename, change.Skill);
+                "SkillResourceApplier reverted demote: restored Provisional={Provisional} and CreatedAt on '{File}' for skill '{Skill}'",
+                priorEntry.Provisional, change.Filename, change.Skill);
         };
 
         return new RepairApplyOutcome(diff, revert);

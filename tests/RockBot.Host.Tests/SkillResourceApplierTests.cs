@@ -165,22 +165,38 @@ public class SkillResourceApplierTests
     }
 
     [TestMethod]
-    public async Task Apply_DemoteProvisional_AlreadyProvisional_NoOp()
+    public async Task Apply_DemoteProvisional_AlreadyProvisional_RestampsCreatedAt()
     {
+        // A resource reaching this op while already provisional (the only state
+        // RunProvisionalValidationPassAsync's Remove case can produce) must still
+        // get a real, meaningful effect — resetting CreatedAt restarts its
+        // validation window, which is what actually re-earns trust. Flipping
+        // Provisional true->true alone would be a no-op (see the review that
+        // caught this: design/reflex-tools.md Phase 1).
         var store = new InMemorySkillResourceStore();
+        var oldCreatedAt = DateTimeOffset.UtcNow.AddDays(-10);
         await store.SaveAsync(new Skill("calendar/scan", "Scan", "# Scan", DateTimeOffset.UtcNow));
         await store.AttachResourceAsync(
             "calendar/scan",
-            new SkillResourceInput("a.json", SkillResourceType.Wisp, "x", "{}",
-                Provisional: true));
+            new SkillResourceInput("a.json", SkillResourceType.Wisp, "x", "{}"),
+            new SkillResource("a.json", SkillResourceType.Wisp, "x",
+                Provisional: true,
+                CreatedAt: oldCreatedAt));
 
         var applier = NewApplier(store);
+        var before = DateTimeOffset.UtcNow;
         var outcome = await applier.ApplyAsync(NewTicket("""
             { "skill": "calendar/scan", "filename": "a.json", "op": "demote-provisional" }
             """), CancellationToken.None);
 
-        Assert.IsFalse(outcome.AppliedDiff.GetProperty("changed").GetBoolean());
-        Assert.IsNull(outcome.Revert);
+        Assert.IsTrue(outcome.AppliedDiff.GetProperty("changed").GetBoolean());
+        var afterEntry = (await store.GetAsync("calendar/scan"))!.Manifest!.Single();
+        Assert.IsTrue(afterEntry.Provisional);
+        Assert.IsTrue(afterEntry.CreatedAt >= before);
+
+        Assert.IsNotNull(outcome.Revert);
+        await outcome.Revert!(CancellationToken.None);
+        Assert.AreEqual(oldCreatedAt, (await store.GetAsync("calendar/scan"))!.Manifest!.Single().CreatedAt);
     }
 
     [TestMethod]

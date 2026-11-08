@@ -223,4 +223,245 @@ public class ProvisionalValidationPassTests
             try { Directory.Delete(tempDir, recursive: true); } catch { /* best-effort */ }
         }
     }
+
+    // ── RecordProvisionalFailureAsync ────────────────────────────────────────
+
+    private static FileFailureClusterStore NewFailureClusterStore(string tempDir) => new(
+        Microsoft.Extensions.Options.Options.Create(new FailureClusterOptions()),
+        Microsoft.Extensions.Options.Options.Create(new AgentProfileOptions { BasePath = tempDir }),
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<FileFailureClusterStore>.Instance);
+
+    [TestMethod]
+    public async Task RecordProvisionalFailure_TwoDistinctSessionFailures_ClusterHasBothSessionIds()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "rb-failcluster-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        var store = NewFailureClusterStore(tempDir);
+        try
+        {
+            await ((Microsoft.Extensions.Hosting.IHostedService)store).StartAsync(default);
+            var resource = ProvWisp();
+            var records = new[]
+            {
+                WispRecord(false, "s2", Now.AddHours(-2)),
+                WispRecord(false, "s3", Now.AddHours(-1)),
+            };
+
+            await DreamService.RecordProvisionalFailureAsync(
+                store, "calendar/scan", resource, records, consecutiveFailureCount: 2, Now, default);
+
+            var clusters = await store.GetAllAsync();
+            var cluster = clusters.Single(c => c.Key.Tool == "calendar/scan" && c.Key.ErrorClass == resource.Filename);
+            CollectionAssert.AreEquivalent(new[] { "s2", "s3" }, cluster.SessionIds.ToList());
+            Assert.AreEqual("skill-resource", cluster.Key.Server);
+        }
+        finally
+        {
+            await store.DisposeAsync();
+            try { Directory.Delete(tempDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [TestMethod]
+    public async Task RecordProvisionalFailure_MixedRealAndEmptySessionIds_RecordsOnlyRealOnes()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "rb-failcluster-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        var store = NewFailureClusterStore(tempDir);
+        try
+        {
+            await ((Microsoft.Extensions.Hosting.IHostedService)store).StartAsync(default);
+            var resource = ProvWisp();
+            var records = new[]
+            {
+                WispRecord(false, "", Now.AddHours(-3)),
+                WispRecord(false, "s2", Now.AddHours(-1)),
+            };
+
+            await DreamService.RecordProvisionalFailureAsync(
+                store, "calendar/scan", resource, records, consecutiveFailureCount: 2, Now, default);
+
+            var cluster = (await store.GetAllAsync())
+                .Single(c => c.Key.Tool == "calendar/scan" && c.Key.ErrorClass == resource.Filename);
+            CollectionAssert.AreEquivalent(new[] { "s2" }, cluster.SessionIds.ToList());
+        }
+        finally
+        {
+            await store.DisposeAsync();
+            try { Directory.Delete(tempDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [TestMethod]
+    public async Task RecordProvisionalFailure_UsesRealErrorMessage_NotGenericConstant()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "rb-failcluster-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        var store = NewFailureClusterStore(tempDir);
+        try
+        {
+            await ((Microsoft.Extensions.Hosting.IHostedService)store).StartAsync(default);
+            var resource = ProvWisp();
+            var records = new[]
+            {
+                WispRecord(false, "s2", Now.AddHours(-1)) with
+                {
+                    ErrorMessage = "missing required field timeZone",
+                    FailedToolName = "get_calendar_events",
+                },
+            };
+
+            await DreamService.RecordProvisionalFailureAsync(
+                store, "calendar/scan", resource, records, consecutiveFailureCount: 2, Now, default);
+
+            var cluster = (await store.GetAllAsync())
+                .Single(c => c.Key.Tool == "calendar/scan" && c.Key.ErrorClass == resource.Filename);
+            Assert.IsTrue(cluster.SampleErrorMessages.Any(m =>
+                m.Contains("get_calendar_events") && m.Contains("missing required field timeZone")));
+        }
+        finally
+        {
+            await store.DisposeAsync();
+            try { Directory.Delete(tempDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [TestMethod]
+    public async Task RecordProvisionalFailure_SameResourceRecordedTwice_AccumulatesNewSessionIds()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "rb-failcluster-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        var store = NewFailureClusterStore(tempDir);
+        try
+        {
+            await ((Microsoft.Extensions.Hosting.IHostedService)store).StartAsync(default);
+            var resource = ProvWisp();
+
+            await DreamService.RecordProvisionalFailureAsync(
+                store, "calendar/scan", resource, [WispRecord(false, "s2", Now.AddHours(-2))], 2, Now, default);
+            await DreamService.RecordProvisionalFailureAsync(
+                store, "calendar/scan", resource, [WispRecord(false, "s3", Now.AddHours(-1))], 2, Now.AddHours(1), default);
+
+            var cluster = (await store.GetAllAsync())
+                .Single(c => c.Key.Tool == "calendar/scan" && c.Key.ErrorClass == resource.Filename);
+            CollectionAssert.AreEquivalent(new[] { "s2", "s3" }, cluster.SessionIds.ToList());
+            Assert.AreEqual(2, cluster.Count);
+        }
+        finally
+        {
+            await store.DisposeAsync();
+            try { Directory.Delete(tempDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [TestMethod]
+    public async Task RecordProvisionalFailure_SameRecordsPassedTwice_DoesNotDoubleCount()
+    {
+        // A still-provisional, still-failing resource gets re-swept every dream
+        // cycle with the SAME historical failing records (nothing new happened).
+        // Re-recording those same records must not inflate Count or push LastSeen
+        // forward forever — both would defeat the escalation threshold's purpose.
+        var tempDir = Path.Combine(Path.GetTempPath(), "rb-failcluster-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        var store = NewFailureClusterStore(tempDir);
+        try
+        {
+            await ((Microsoft.Extensions.Hosting.IHostedService)store).StartAsync(default);
+            var resource = ProvWisp();
+            var records = new[]
+            {
+                WispRecord(false, "s2", Now.AddHours(-2)),
+                WispRecord(false, "s3", Now.AddHours(-1)),
+            };
+
+            await DreamService.RecordProvisionalFailureAsync(
+                store, "calendar/scan", resource, records, 2, Now, default);
+            var afterFirst = (await store.GetAllAsync())
+                .Single(c => c.Key.Tool == "calendar/scan" && c.Key.ErrorClass == resource.Filename);
+
+            // Next dream cycle, same records (no new wisp activity occurred).
+            await DreamService.RecordProvisionalFailureAsync(
+                store, "calendar/scan", resource, records, 2, Now.AddHours(1), default);
+            var afterSecond = (await store.GetAllAsync())
+                .Single(c => c.Key.Tool == "calendar/scan" && c.Key.ErrorClass == resource.Filename);
+
+            Assert.AreEqual(afterFirst.Count, afterSecond.Count);
+            Assert.AreEqual(afterFirst.LastSeen, afterSecond.LastSeen);
+            CollectionAssert.AreEquivalent(new[] { "s2", "s3" }, afterSecond.SessionIds.ToList());
+        }
+        finally
+        {
+            await store.DisposeAsync();
+            try { Directory.Delete(tempDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [TestMethod]
+    public async Task RecordProvisionalFailure_NewFailure_IncrementsFlaggedCounter()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "rb-failcluster-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        var store = NewFailureClusterStore(tempDir);
+        try
+        {
+            await ((Microsoft.Extensions.Hosting.IHostedService)store).StartAsync(default);
+            var resource = ProvWisp();
+            long count = 0;
+            using var listener = new System.Diagnostics.Metrics.MeterListener();
+            listener.InstrumentPublished = (instrument, l) =>
+            {
+                if (ReferenceEquals(instrument, HostDiagnostics.RepairSkillResourceFlagged))
+                    l.EnableMeasurementEvents(instrument);
+            };
+            listener.SetMeasurementEventCallback<long>((_, value, _, _) => Interlocked.Add(ref count, value));
+            listener.Start();
+
+            await DreamService.RecordProvisionalFailureAsync(
+                store, "calendar/scan", resource, [WispRecord(false, "s2", Now.AddHours(-1))], 2, Now, default);
+
+            Assert.AreEqual(1, count);
+        }
+        finally
+        {
+            await store.DisposeAsync();
+            try { Directory.Delete(tempDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [TestMethod]
+    public async Task RecordProvisionalFailure_SameRecordsPassedTwice_DoesNotIncrementCounterAgain()
+    {
+        // Mirrors RecordProvisionalFailure_SameRecordsPassedTwice_DoesNotDoubleCount:
+        // a dream cycle that finds nothing new must not re-emit the "flagged" counter.
+        var tempDir = Path.Combine(Path.GetTempPath(), "rb-failcluster-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        var store = NewFailureClusterStore(tempDir);
+        try
+        {
+            await ((Microsoft.Extensions.Hosting.IHostedService)store).StartAsync(default);
+            var resource = ProvWisp();
+            var records = new[] { WispRecord(false, "s2", Now.AddHours(-1)) };
+            long count = 0;
+            using var listener = new System.Diagnostics.Metrics.MeterListener();
+            listener.InstrumentPublished = (instrument, l) =>
+            {
+                if (ReferenceEquals(instrument, HostDiagnostics.RepairSkillResourceFlagged))
+                    l.EnableMeasurementEvents(instrument);
+            };
+            listener.SetMeasurementEventCallback<long>((_, value, _, _) => Interlocked.Add(ref count, value));
+            listener.Start();
+
+            await DreamService.RecordProvisionalFailureAsync(
+                store, "calendar/scan", resource, records, 2, Now, default);
+            await DreamService.RecordProvisionalFailureAsync(
+                store, "calendar/scan", resource, records, 2, Now.AddHours(1), default);
+
+            Assert.AreEqual(1, count, "the second sweep saw no new failures and must not re-emit the counter");
+        }
+        finally
+        {
+            await store.DisposeAsync();
+            try { Directory.Delete(tempDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
 }
