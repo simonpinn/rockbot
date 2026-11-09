@@ -1,0 +1,86 @@
+@page "/consciousness"
+@rendermode InteractiveServer
+@attribute [Authorize]
+@using Microsoft.AspNetCore.Authorization
+@using RockBot.UserProxy.Blazor.Services
+@inject ReflexActivityStateService Feed
+@implements IDisposable
+
+<PageTitle>Reflex activity</PageTitle>
+
+<div class="chat-container d-flex flex-column">
+    <div class="chat-header bg-primary text-white p-3 d-flex justify-content-between align-items-center">
+        <div class="d-flex align-items-baseline gap-2">
+            <h1 class="h4 mb-0">Reflex activity</h1>
+            <span class="small opacity-75">a view onto what is effectively a background consciousness</span>
+        </div>
+        <a class="btn btn-sm btn-outline-light" href="/">Back to chat</a>
+    </div>
+
+    <div class="flex-grow-1 overflow-auto p-3">
+        @if (Feed.Events.Count == 0)
+        {
+            <p class="text-muted">No reflex has fired yet.</p>
+        }
+        else
+        {
+            <table class="table table-sm">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Tool</th>
+                        <th>Trigger</th>
+                        <th>X-factor</th>
+                        <th>Result</th>
+                        <th>Duration</th>
+                        <th>Detail</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var evt in Feed.Events)
+                    {
+                        <tr class="@(evt.Succeeded ? "" : "table-danger")">
+                            <td>@evt.FiredAt.ToLocalTime().ToString("HH:mm:ss")</td>
+                            <td><code>@evt.ToolName</code></td>
+                            <td>
+                                @if (evt.Trigger == "stimulus")
+                                {
+                                    <span class="badge bg-info" title="@evt.StimulusPatternId">stimulus</span>
+                                }
+                                else
+                                {
+                                    <span class="badge bg-secondary" title="@evt.SessionId">llm</span>
+                                }
+                            </td>
+                            <td class="small text-muted">
+                                @if (evt.XFactor is not null)
+                                {
+                                    @($"[{evt.XFactor.Channel}] \"{evt.XFactor.Value}\" (w={evt.XFactor.SalienceWeight:F2})")
+                                }
+                            </td>
+                            <td>@(evt.Succeeded ? "✅" : "❌")</td>
+                            <td>@(evt.DurationMs) ms</td>
+                            <td class="text-muted small">@evt.ErrorMessage</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </div>
+</div>
+
+@code {
+    private Action? _stateChangedHandler;
+
+    protected override void OnInitialized()
+    {
+        _stateChangedHandler = () => InvokeAsync(StateHasChanged);
+        Feed.OnStateChanged += _stateChangedHandler;
+    }
+
+    public void Dispose()
+    {
+        if (_stateChangedHandler is not null)
+            Feed.OnStateChanged -= _stateChangedHandler;
+    }
+}

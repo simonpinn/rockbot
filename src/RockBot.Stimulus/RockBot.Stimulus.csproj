@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>RockBot.Stimulus</RootNamespace>
+    <IsPackable>true</IsPackable>
+    <Description>Bus-triggered reflex firing: a stimulus pattern matches an inbound message and fires a validated reflex tool with no LLM involvement.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="RockBot.Stimulus.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.*" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.*" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.*" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RockBot.Messaging.Abstractions\RockBot.Messaging.Abstractions.csproj" />
+    <ProjectReference Include="..\RockBot.Tools.Abstractions\RockBot.Tools.Abstractions.csproj" />
+    <!--
+      AgentHostBuilder (the extension point AddStimulusDispatcher hangs off) lives in the
+      concrete RockBot.Host project, not RockBot.Host.Abstractions - RockBot.Tools.Reflex
+      references RockBot.Host for the exact same reason. This pulls in Host.Abstractions
+      transitively (StimulusInvocationContext, AgentProfileOptions, etc.), so no separate
+      Abstractions reference is needed.
+    -->
+    <ProjectReference Include="..\RockBot.Host\RockBot.Host.csproj" />
+  </ItemGroup>
+
+</Project>
