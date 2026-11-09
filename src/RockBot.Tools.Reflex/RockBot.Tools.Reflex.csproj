@@ -25,6 +25,7 @@
     <ProjectReference Include="..\RockBot.Host\RockBot.Host.csproj" />
     <ProjectReference Include="..\RockBot.Wisp\RockBot.Wisp.csproj" />
     <ProjectReference Include="..\RockBot.Tools.Mcp\RockBot.Tools.Mcp.csproj" />
+    <ProjectReference Include="..\RockBot.Tools\RockBot.Tools.csproj" />
   </ItemGroup>
 
 </Project>

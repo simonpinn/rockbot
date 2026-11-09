@@ -189,6 +189,59 @@ public class AgentContextBuilderSkillRecallFramingTests
         Assert.IsNull(FindSystemMessageContaining(messages, "Skill: mcp-learned"));
     }
 
+    [TestMethod]
+    public async Task SkillIndex_NoReflexHooks_RendersUnchanged()
+    {
+        var wispSkill = new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest:
+            [new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false)]);
+        var skillStore = new StubSkillStore(search: []) { ListResult = [wispSkill] };
+        var (builder, _) = BuildBuilder(skillStore: skillStore, reflexHooks: null);
+
+        var messages = await builder.BuildAsync("session-no-reflex", LongMessage, CancellationToken.None);
+
+        var index = FindSystemMessageContaining(messages, "Available skills");
+        Assert.IsNotNull(index);
+        StringAssert.Contains(index, "- calendar/scan [Wisp]: s");
+        Assert.IsFalse(index.Contains("direct:"), "with no reflexHooks, the index must render exactly as before Phase 3");
+    }
+
+    [TestMethod]
+    public async Task SkillIndex_ValidatedWispWithRegisteredReflex_ShowsDirectlyCallableToolName()
+    {
+        var wispSkill = new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest:
+            [new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false)]);
+        var skillStore = new StubSkillStore(search: []) { ListResult = [wispSkill] };
+        var hooks = new FakeReflexActivationHooks();
+        hooks.ToolNames[("calendar/scan", "fanout.json")] = "reflex__calendar_scan__fanout_json";
+        var (builder, _) = BuildBuilder(skillStore: skillStore, reflexHooks: hooks);
+
+        var messages = await builder.BuildAsync("session-with-reflex", LongMessage, CancellationToken.None);
+
+        var index = FindSystemMessageContaining(messages, "Available skills");
+        Assert.IsNotNull(index);
+        StringAssert.Contains(index, "reflex__calendar_scan__fanout_json");
+    }
+
+    [TestMethod]
+    public async Task SkillRecall_RecalledSkill_IsPinnedUnderTheRealToolSessionIdOnEveryTurn()
+    {
+        var skill = BriefingSkill();
+        var skillStore = new StubSkillStore(search: [skill]);
+        var hooks = new FakeReflexActivationHooks();
+        var (builder, _) = BuildBuilder(skillStore: skillStore, reflexHooks: hooks);
+
+        await builder.BuildAsync("session-recall-pin", LongMessage, CancellationToken.None);
+        await builder.BuildAsync("session-recall-pin", LongMessage, CancellationToken.None);
+
+        Assert.AreEqual(2, hooks.SurfacedCalls.Count(c => c.SkillName == skill.Name),
+            "a still-relevant skill must be re-surfaced (re-pinned) on every turn it's recalled, " +
+            "not only the first, or it can never be reached again once evicted by a later pin");
+        Assert.AreEqual("session/session-recall-pin", hooks.SurfacedCalls[0].SessionId,
+            "must pin under the same id the loader tool and every other registry tool carry as " +
+            "their ISessionBoundTool.SessionId (session/{sessionId} here) — not the raw sessionId, " +
+            "which GetActivated is never actually queried with");
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static string? FindSystemMessageContaining(IEnumerable<ChatMessage> messages, string fragment)
@@ -202,7 +255,7 @@ public class AgentContextBuilderSkillRecallFramingTests
     }
 
     private static (AgentContextBuilder Builder, KnowledgeGraphOptions Options) BuildBuilder(
-        ISkillStore? skillStore = null)
+        ISkillStore? skillStore = null, IReflexActivationHooks? reflexHooks = null)
     {
         var profileHolder = new ProfileHolder();
         var doc = new AgentProfileDocument("soul", null, [], "I am a test agent.");
@@ -240,7 +293,8 @@ public class AgentContextBuilderSkillRecallFramingTests
             knowledgeGraphProviders: [],
             knowledgeGraphOptions: Options.Create(graphOpts),
             embeddingGenerators: [],
-            logger: NullLogger<AgentContextBuilder>.Instance);
+            logger: NullLogger<AgentContextBuilder>.Instance,
+            reflexHooks: reflexHooks);
 
         return (builder, graphOpts);
     }
@@ -249,15 +303,31 @@ public class AgentContextBuilderSkillRecallFramingTests
 
     private sealed class StubSkillStore(IReadOnlyList<Skill> search, params Skill[] stored) : ISkillStore
     {
+        /// <summary>Backs <see cref="ListAsync"/>; an object-initializer property (not a
+        /// constructor parameter) so existing positional <c>StubSkillStore(...)</c> call sites
+        /// in this file are unaffected. Defaults to empty, preserving today's behavior.</summary>
+        public IReadOnlyList<Skill> ListResult { get; init; } = [];
+
         public Task SaveAsync(Skill skill) => Task.CompletedTask;
         public Task<Skill?> GetAsync(string name) =>
             Task.FromResult(stored.FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase)));
-        public Task<IReadOnlyList<Skill>> ListAsync() => Task.FromResult<IReadOnlyList<Skill>>([]);
+        public Task<IReadOnlyList<Skill>> ListAsync() => Task.FromResult(ListResult);
         public Task DeleteAsync(string name) => Task.CompletedTask;
 
         public Task<IReadOnlyList<Skill>> SearchAsync(
             string query, int maxResults, CancellationToken cancellationToken = default, float[]? queryEmbedding = null) =>
             Task.FromResult(search);
+    }
+
+    private sealed class FakeReflexActivationHooks : IReflexActivationHooks
+    {
+        public Dictionary<(string Skill, string Filename), string> ToolNames { get; } = new();
+        public List<(string? SessionId, string SkillName)> SurfacedCalls { get; } = [];
+
+        public void OnSkillSurfaced(string? sessionId, string skillName) => SurfacedCalls.Add((sessionId, skillName));
+
+        public string? TryGetToolName(string skillName, string filename) =>
+            ToolNames.TryGetValue((skillName, filename), out var name) ? name : null;
     }
 
     private sealed class StubLongTermMemory : ILongTermMemory

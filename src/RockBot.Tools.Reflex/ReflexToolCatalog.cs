@@ -24,6 +24,10 @@ public sealed class ReflexToolCatalog(
     private readonly object _gate = new();
     private volatile IReadOnlyDictionary<string, (string SkillName, string Filename)> _byName =
         new Dictionary<string, (string SkillName, string Filename)>();
+    private ReflexToolSurface? _surface;
+
+    /// <summary>Supplies the session surface a demoted/deleted reflex tool is evicted from.</summary>
+    internal void Bind(ReflexToolSurface surface) => _surface = surface;
 
     public async Task ReconcileOnceAsync(CancellationToken ct)
     {
@@ -60,6 +64,7 @@ public sealed class ReflexToolCatalog(
             }
         }
 
+        List<string> stale = [];
         lock (_gate)
         {
             var current = _byName;
@@ -68,7 +73,10 @@ public sealed class ReflexToolCatalog(
             foreach (var name in current.Keys)
             {
                 if (!desired.ContainsKey(name))
+                {
                     registry.Unregister(name);
+                    stale.Add(name);
+                }
             }
 
             var registered = new Dictionary<string, (string SkillName, string Filename)>();
@@ -105,6 +113,9 @@ public sealed class ReflexToolCatalog(
 
             _byName = registered;
         }
+
+        if (stale.Count > 0)
+            _surface?.Evict(stale.ToHashSet());
     }
 
     bool IReflexRegistrationLookup.TryGet(string toolName, out string skillName, out string filename)
@@ -118,4 +129,7 @@ public sealed class ReflexToolCatalog(
         filename = "";
         return false;
     }
+
+    IReadOnlyList<string> IReflexRegistrationLookup.GetToolNames(string skillName) =>
+        _byName.Where(kv => kv.Value.SkillName == skillName).Select(kv => kv.Key).ToArray();
 }

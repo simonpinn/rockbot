@@ -8,4 +8,7 @@ namespace RockBot.Tools.Reflex;
 internal interface IReflexRegistrationLookup
 {
     bool TryGet(string toolName, out string skillName, out string filename);
+
+    /// <summary>Every currently-registered reflex tool name belonging to <paramref name="skillName"/>.</summary>
+    IReadOnlyList<string> GetToolNames(string skillName);
 }

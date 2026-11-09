@@ -208,6 +208,9 @@ internal sealed class FakeReflexRegistrationLookup : IReflexRegistrationLookup
         filename = "";
         return false;
     }
+
+    public IReadOnlyList<string> GetToolNames(string skillName) =>
+        _byName.Where(kv => kv.Value.SkillName == skillName).Select(kv => kv.Key).ToArray();
 }
 
 internal sealed class FakeSkillStore : ISkillStore

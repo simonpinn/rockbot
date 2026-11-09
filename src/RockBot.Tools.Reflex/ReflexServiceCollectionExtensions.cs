@@ -29,13 +29,23 @@ public static class ReflexServiceCollectionExtensions
         configure?.Invoke(options);
         builder.Services.AddSingleton(options);
 
-        builder.Services.AddSingleton<ReflexToolCatalog>(sp => new ReflexToolCatalog(
-            sp.GetRequiredService<ISkillStore>(),
-            sp.GetRequiredService<IToolRegistry>(),
-            () => sp.GetRequiredService<ReflexExecutor>(),
-            sp.GetRequiredService<ILogger<ReflexToolCatalog>>()));
+        builder.Services.AddSingleton<ReflexToolSurface>();
+        builder.Services.AddSingleton<ReflexToolCatalog>(sp =>
+        {
+            var catalog = new ReflexToolCatalog(
+                sp.GetRequiredService<ISkillStore>(),
+                sp.GetRequiredService<IToolRegistry>(),
+                () => sp.GetRequiredService<ReflexExecutor>(),
+                sp.GetRequiredService<ILogger<ReflexToolCatalog>>());
+            var surface = sp.GetRequiredService<ReflexToolSurface>();
+            catalog.Bind(surface);
+            surface.Bind(catalog);
+            return catalog;
+        });
         builder.Services.TryAddSingleton<IReflexRegistrationLookup>(
             sp => sp.GetRequiredService<ReflexToolCatalog>());
+        builder.Services.TryAddSingleton<IReflexActivationHooks>(
+            sp => sp.GetRequiredService<ReflexToolSurface>());
 
         builder.Services.AddSingleton<ReflexExecutor>(sp => new ReflexExecutor(
             sp.GetRequiredService<IReflexRegistrationLookup>(),

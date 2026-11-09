@@ -153,6 +153,57 @@ public class ReflexToolCatalogTests
             "once the name frees up, the next cycle must successfully claim it");
     }
 
+    [TestMethod]
+    public async Task ReconcileOnceAsync_ResourceDemotedSinceLastCycle_EvictsFromBoundSurface()
+    {
+        var resource = new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false);
+        var skillStore = new FakeSkillStore
+        {
+            Skills = [new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest: [resource])],
+        };
+        var registry = new FakeToolRegistry();
+        var catalog = NewCatalog(skillStore, registry);
+        var surface = new ReflexToolSurface(registry, NullLogger<ReflexToolSurface>.Instance);
+        surface.Bind((IReflexRegistrationLookup)catalog);
+        catalog.Bind(surface);
+
+        await catalog.ReconcileOnceAsync(CancellationToken.None);
+        var name = ReflexToolNames.Build("calendar/scan", "fanout.json");
+        surface.ActivateByName("sess", name);
+        Assert.IsTrue(surface.IsActivated("sess", name), "precondition");
+
+        skillStore.Skills[0] = skillStore.Skills[0] with
+        {
+            Manifest = [resource with { Provisional = true }],
+        };
+        await catalog.ReconcileOnceAsync(CancellationToken.None);
+
+        Assert.IsFalse(surface.IsActivated("sess", name));
+    }
+
+    [TestMethod]
+    public async Task GetToolNames_ReturnsOnlyToolsRegisteredForThatSkill()
+    {
+        var skillStore = new FakeSkillStore
+        {
+            Skills =
+            [
+                new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest:
+                    [new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false)]),
+                new Skill("other/skill", "s", "c", DateTimeOffset.UtcNow, Manifest:
+                    [new SkillResource("x.json", SkillResourceType.Wisp, "d", Provisional: false)]),
+            ],
+        };
+        var registry = new FakeToolRegistry();
+        var catalog = NewCatalog(skillStore, registry);
+        await catalog.ReconcileOnceAsync(CancellationToken.None);
+
+        var lookup = (IReflexRegistrationLookup)catalog;
+        var expected = ReflexToolNames.Build("calendar/scan", "fanout.json");
+        CollectionAssert.AreEqual(new[] { expected }, lookup.GetToolNames("calendar/scan").ToArray());
+        Assert.AreEqual(0, lookup.GetToolNames("no-such-skill").Count);
+    }
+
     private static ReflexToolCatalog NewCatalog(ISkillStore skillStore, IToolRegistry registry) =>
         new(skillStore, registry, () => StubExecutor, NullLogger<ReflexToolCatalog>.Instance);
 }
