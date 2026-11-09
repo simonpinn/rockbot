@@ -498,6 +498,93 @@ public class SubagentManagerTests
         Assert.IsTrue(result.ToolCalls[1].ChangesState);
     }
 
+    [TestMethod]
+    public async Task SubagentCallingGetSkill_RecordsASkillUsageEvent()
+    {
+        // Regression for a bug found live: SubagentRunner built SkillTools without passing
+        // usageStore, so no subagent's get_skill call ever recorded a SkillInvocationEvent —
+        // which meant DreamService's wisp-success-analysis pass could never resolve
+        // invokingSkill for any subagent-originated wisp pattern, so it silently never
+        // promoted anything, system-wide.
+        var usageStore = new RecordingSkillUsageStore();
+        var skillStore = new FakeSkillStoreWithOneSkill("test-skill");
+        var publisher = new CapturingPublisher();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        AddSubagentRunnerStubs(services, new GetSkillThenTextLlmClient("test-skill"));
+        services.AddSingleton<IMessagePublisher>(publisher);
+        services.AddSingleton<ISkillStore>(skillStore);
+        services.AddSingleton<ISkillUsageStore>(usageStore);
+        services.AddSingleton(new ModelBehavior { UseTextBasedToolCalling = true });
+        var provider = services.BuildServiceProvider();
+        var manager = new SubagentManager(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new SubagentOptions()),
+            publisher,
+            new AgentIdentity("TestBot"),
+            NullLogger<SubagentManager>.Instance);
+
+        await manager.SpawnAsync("Summarize the Trello board", null, null, "session/s1", CancellationToken.None);
+        var result = await publisher.WaitForResultAsync(TimeSpan.FromSeconds(10));
+
+        Assert.IsNotNull(result, "the subagent run should have completed and published a result");
+        Assert.AreEqual(1, usageStore.Recorded.Count,
+            "get_skill must record a SkillInvocationEvent even when called from a subagent session");
+        Assert.AreEqual("test-skill", usageStore.Recorded[0].SkillName);
+    }
+
+    private sealed class RecordingSkillUsageStore : ISkillUsageStore
+    {
+        public List<SkillInvocationEvent> Recorded { get; } = [];
+
+        public Task AppendAsync(SkillInvocationEvent evt, CancellationToken cancellationToken = default)
+        {
+            lock (Recorded) Recorded.Add(evt);
+            return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<SkillInvocationEvent>> GetBySessionAsync(string sessionId, CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<SkillInvocationEvent>>(Recorded.Where(e => e.SessionId == sessionId).ToList());
+
+        public Task<IReadOnlyList<SkillInvocationEvent>> QueryRecentAsync(DateTimeOffset since, int maxResults, CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<SkillInvocationEvent>>(Recorded.Where(e => e.Timestamp >= since).Take(maxResults).ToList());
+    }
+
+    private sealed class FakeSkillStoreWithOneSkill(string name) : ISkillStore
+    {
+        private readonly Skill _skill = new(name, "A test skill.", "Do the thing.", DateTimeOffset.UtcNow);
+
+        public Task SaveAsync(Skill skill) => Task.CompletedTask;
+        public Task<Skill?> GetAsync(string skillName) =>
+            Task.FromResult(skillName == name ? _skill : null);
+        public Task<IReadOnlyList<Skill>> ListAsync() => Task.FromResult<IReadOnlyList<Skill>>([_skill]);
+        public Task DeleteAsync(string skillName) => Task.CompletedTask;
+        public Task<IReadOnlyList<Skill>> SearchAsync(string query, int maxResults,
+            CancellationToken cancellationToken = default, float[]? queryEmbedding = null) =>
+            Task.FromResult<IReadOnlyList<Skill>>([_skill]);
+    }
+
+    /// <summary>First call returns a get_skill call for <paramref name="skillName"/>; second call answers.</summary>
+    private sealed class GetSkillThenTextLlmClient(string skillName) : ILlmClient
+    {
+        private int _calls;
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            var message = Interlocked.Increment(ref _calls) == 1
+                ? new ChatMessage(ChatRole.Assistant,
+                    [new FunctionCallContent("call-1", "get_skill", new Dictionary<string, object?> { ["name"] = skillName })])
+                : new ChatMessage(ChatRole.Assistant, "Summary complete.");
+            return Task.FromResult(new ChatResponse(message));
+        }
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ModelTier tier, ChatOptions? options = null,
+            CancellationToken cancellationToken = default) =>
+            GetResponseAsync(messages, options, cancellationToken);
+    }
+
     /// <summary>Stands in for the FICC: records a write and an upload into the run's ledger, then answers.</summary>
     private sealed class LedgerRecordingLlmClient : ILlmClient
     {
