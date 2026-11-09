@@ -38,6 +38,7 @@ internal sealed class DreamService : IHostedService, IDisposable
     private readonly IKnowledgeGraph? _knowledgeGraph;
     private readonly IWorkingMemory? _workingMemory;
     private readonly ILlmClient _llmClient;
+    private readonly LlmCostEstimator _costEstimator;
     private readonly TieredChatClientRegistry? _tieredRegistry;
     private readonly IAgentWorkSerializer _workSerializer;
     private readonly IUserActivityMonitor _userActivityMonitor;
@@ -86,6 +87,7 @@ internal sealed class DreamService : IHostedService, IDisposable
     private string? _repairTicketCreationDirective;
     private IReadOnlyList<LlmPricingRow>? _pricingRows;
     private DreamPassLedger? _passLedger;
+    private DreamCostTracker? _costTracker;
     private int _contentionRetries;
 
     // Fires at StopAsync so an in-flight cycle unwinds through its existing
@@ -101,6 +103,7 @@ internal sealed class DreamService : IHostedService, IDisposable
         ILongTermMemory memory,
         IEnumerable<ISkillStore> skillStores,
         ILlmClient llmClient,
+        LlmCostEstimator costEstimator,
         IAgentWorkSerializer workSerializer,
         IUserActivityMonitor userActivityMonitor,
         AgentClock clock,
@@ -145,6 +148,7 @@ internal sealed class DreamService : IHostedService, IDisposable
         _wispExecutionLog = wispExecutionLog;
         _workingMemory = workingMemory;
         _llmClient = llmClient;
+        _costEstimator = costEstimator;
         _tieredRegistry = tieredRegistry;
         _workSerializer = workSerializer;
         _userActivityMonitor = userActivityMonitor;
@@ -734,6 +738,7 @@ internal sealed class DreamService : IHostedService, IDisposable
         // Clear before loading so the finally below cannot re-save the previous cycle's
         // ledger if the load itself throws.
         _passLedger = null;
+        _costTracker = null;
 
         try
         {
@@ -746,6 +751,9 @@ internal sealed class DreamService : IHostedService, IDisposable
             // LLM call on a corpus that has not moved since they last looked at it.
             _passLedger = await DreamPassLedger.LoadAsync(
                 ResolvePath(DreamPassLedger.FileName, _profileOptions.BasePath), _logger);
+
+            _costTracker = await DreamCostTracker.LoadAsync(
+                ResolvePath(DreamCostTracker.FileName, _profileOptions.BasePath), _logger);
 
             _logger.LogInformation("DreamService: dream cycle starting");
 
@@ -842,6 +850,21 @@ internal sealed class DreamService : IHostedService, IDisposable
             // gated pass next time.
             if (_passLedger is not null)
                 await _passLedger.SaveAsync();
+
+            // Same reasoning for cost: fold whatever passes completed into the lifetime totals
+            // even on a preempted or failed cycle, rather than losing that spend from the record.
+            if (_costTracker is not null)
+            {
+                _costTracker.FinishCycle(_clock.Now);
+                var cycle = _costTracker.Lifetime;
+                _logger.LogInformation(
+                    "DreamService: dream cycle cost — ${CostUsd:F4} ({PassRuns} LLM call(s), " +
+                    "{InputTokens:N0} in / {OutputTokens:N0} out, {CachedTokens:N0} cached) — lifetime ${LifetimeCostUsd:F4} over {TotalCycles} cycle(s)",
+                    cycle.LastCycleCostUsd, cycle.LastCyclePassRuns, cycle.LastCycleInputTokens,
+                    cycle.LastCycleOutputTokens, cycle.LastCycleCachedInputTokens,
+                    cycle.TotalCostUsd, cycle.TotalCycles);
+                await _costTracker.SaveAsync();
+            }
 
             await slot.DisposeAsync();
         }
@@ -5521,7 +5544,8 @@ internal sealed class DreamService : IHostedService, IDisposable
                 provisional.Count);
 
             var promoted = 0;
-            var removed = 0;
+            var flaggedForRepair = 0;
+            var removedFallback = 0;
             var staled = 0;
             var now = DateTimeOffset.UtcNow;
 
@@ -5566,31 +5590,37 @@ internal sealed class DreamService : IHostedService, IDisposable
                         }
                         break;
                     case ProvisionalAction.Remove:
-                        if (await _skillStore.RemoveResourceAsync(skillName, resource.Filename))
+                        if (RepairLoopEnabled)
                         {
-                            removed++;
-                            _logger.LogInformation(
-                                "DreamService: provisional validation — removed '{File}' on '{Skill}' (consecutiveFailures={Failures})",
-                                resource.Filename, skillName, decision.ConsecutiveFailureCount);
-
-                            if (_failureClusterStore is not null)
+                            try
                             {
-                                try
-                                {
-                                    var clusterKey = new ClusterKey(
-                                        Server: "skill-resource",
-                                        Tool: skillName,
-                                        ErrorClass: resource.Filename);
-                                    var sampleError = $"provisional resource removed after {decision.ConsecutiveFailureCount} consecutive failures";
-                                    await _failureClusterStore.RecordAsync(
-                                        clusterKey, sessionId: null, sampleError, now, ct);
-                                }
-                                catch (Exception ex)
-                                {
-                                    _logger.LogWarning(ex,
-                                        "DreamService: provisional validation — failed to record removal cluster for '{Skill}/{File}'",
-                                        skillName, resource.Filename);
-                                }
+                                await RecordProvisionalFailureAsync(
+                                    _failureClusterStore!, skillName, resource, wispRecords,
+                                    decision.ConsecutiveFailureCount, now, ct);
+                                flaggedForRepair++;
+                                _logger.LogInformation(
+                                    "DreamService: provisional validation — flagged '{File}' on '{Skill}' for repair (consecutiveFailures={Failures})",
+                                    resource.Filename, skillName, decision.ConsecutiveFailureCount);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex,
+                                    "DreamService: provisional validation — failed to record failure cluster for '{Skill}/{File}'",
+                                    skillName, resource.Filename);
+                            }
+                        }
+                        else
+                        {
+                            // The repair loop is unavailable (disabled, or one of its
+                            // collaborators is missing) — fall back to the old direct
+                            // removal rather than leave the resource in permanent limbo
+                            // with nothing to ever revisit it.
+                            if (await _skillStore.RemoveResourceAsync(skillName, resource.Filename))
+                            {
+                                removedFallback++;
+                                _logger.LogInformation(
+                                    "DreamService: provisional validation — removed '{File}' on '{Skill}' directly (repair loop unavailable, consecutiveFailures={Failures})",
+                                    resource.Filename, skillName, decision.ConsecutiveFailureCount);
                             }
                         }
                         break;
@@ -5615,9 +5645,76 @@ internal sealed class DreamService : IHostedService, IDisposable
             }
 
             _logger.LogInformation(
-                "DreamService: provisional validation pass complete — {Promoted} promoted, {Removed} removed, {Stale} marked stale ({Total} considered)",
-                promoted, removed, staled, provisional.Count);
+                "DreamService: provisional validation pass complete — {Promoted} promoted, {FlaggedForRepair} flagged for repair, {RemovedFallback} removed directly (repair loop unavailable), {Stale} marked stale ({Total} considered)",
+                promoted, flaggedForRepair, removedFallback, staled, provisional.Count);
         });
+    }
+
+    /// <summary>
+    /// Records a provisional resource's failure into the failure-cluster store using
+    /// the real session ids from its recent failing wisp records, instead of deleting
+    /// the resource outright. Once the resulting cluster genuinely crosses the
+    /// escalation threshold (two distinct sessions), the repair-ticket creation pass
+    /// picks it up and proposes a retraining fix — see design/reflex-tools.md Phase 1.
+    /// </summary>
+    internal static async Task RecordProvisionalFailureAsync(
+        IFailureClusterStore failureClusterStore,
+        string skillName,
+        SkillResource resource,
+        IReadOnlyList<WispExecutionRecord> wispRecords,
+        int consecutiveFailureCount,
+        DateTimeOffset now,
+        CancellationToken ct)
+    {
+        var clusterKey = new ClusterKey(
+            Server: "skill-resource",
+            Tool: skillName,
+            ErrorClass: resource.Filename);
+
+        // A still-provisional, still-failing resource is swept every dream cycle
+        // with the same historical records until something new happens. Only
+        // record failures genuinely newer than this cluster's current LastSeen,
+        // or Count inflates and LastSeen keeps refreshing on dream cadence alone —
+        // defeating the escalation window's purpose (caught in review).
+        var existingLastSeen = (await failureClusterStore.GetAllAsync(ct))
+            .Where(c => c.Key == clusterKey)
+            .Select(c => (DateTimeOffset?)c.LastSeen)
+            .FirstOrDefault();
+
+        var newFailures = wispRecords
+            .Where(r => !r.Succeeded && (existingLastSeen is null || r.Timestamp > existingLastSeen))
+            .OrderBy(r => r.Timestamp)
+            .ToList();
+
+        if (newFailures.Count == 0)
+            return;
+
+        HostDiagnostics.RepairSkillResourceFlagged.Add(1);
+
+        string SampleFor(WispExecutionRecord r) =>
+            !string.IsNullOrEmpty(r.ErrorMessage)
+                ? (!string.IsNullOrEmpty(r.FailedToolName) ? $"{r.FailedToolName}: {r.ErrorMessage}" : r.ErrorMessage)
+                : $"provisional resource failing after {consecutiveFailureCount} consecutive failures";
+
+        var sessionIds = newFailures
+            .Where(r => !string.IsNullOrEmpty(r.SessionId))
+            .Select(r => r.SessionId!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (sessionIds.Count == 0)
+        {
+            var last = newFailures[^1];
+            await failureClusterStore.RecordAsync(clusterKey, sessionId: null, SampleFor(last), last.Timestamp, ct);
+            return;
+        }
+
+        foreach (var sessionId in sessionIds)
+        {
+            var representative = newFailures.Last(r => r.SessionId == sessionId);
+            await failureClusterStore.RecordAsync(
+                clusterKey, sessionId, SampleFor(representative), representative.Timestamp, ct);
+        }
     }
 
     /// <summary>
@@ -5628,7 +5725,10 @@ internal sealed class DreamService : IHostedService, IDisposable
     /// Promotion rule: distinct-session successes (or distinct-session checkouts for
     /// non-wisp) reach <paramref name="successThreshold"/> → flip non-provisional.
     /// Removal rule: most-recent <paramref name="failureThreshold"/> wisp records
-    /// for this hash all failed → remove + record cluster.
+    /// for this hash all failed → <see cref="ProvisionalAction.Remove"/> (despite
+    /// the name, the caller no longer deletes outright on this — it flags the
+    /// resource for the repair-ticket retrain path and only deletes if that
+    /// escalates; see design/reflex-tools.md Phase 1).
     /// Stale rule: resource older than <paramref name="staleAfter"/> with no usage
     /// activity since creation → mark stale.
     /// Otherwise: keep as-is.
@@ -6273,6 +6373,16 @@ internal sealed class DreamService : IHostedService, IDisposable
             new ChatOptions { ResponseFormat = ChatResponseFormat.Json },
             ct);
 
+        if (response.Usage is { } usage && _costTracker is not null)
+        {
+            var inputTokens = usage.InputTokenCount ?? 0;
+            var outputTokens = usage.OutputTokenCount ?? 0;
+            var cachedInputTokens = UsageReader.GetCachedInputTokens(usage);
+            var modelId = _tieredRegistry?.GetModelId(_options.ModelTier) ?? _options.ModelTier.ToString();
+            var costUsd = _costEstimator.EstimateCost(modelId, inputTokens, outputTokens, cachedInputTokens);
+            _costTracker.RecordPass(inputTokens, outputTokens, cachedInputTokens, costUsd);
+        }
+
         var raw = response.Text?.Trim() ?? string.Empty;
         var json = ExtractJsonObject(raw);
         if (string.IsNullOrEmpty(json))
@@ -6714,7 +6824,12 @@ internal sealed class DreamService : IHostedService, IDisposable
         return string.Empty;
     }
 
-    private static string ResolvePath(string path, string basePath)
+    /// <summary>
+    /// Resolves a filename relative to <paramref name="basePath"/>. Internal rather than private
+    /// because <see cref="DreamCostToolRegistrar"/> needs the exact same path DreamService itself
+    /// writes <see cref="DreamCostTracker"/> to, and two copies of this logic would drift.
+    /// </summary>
+    internal static string ResolvePath(string path, string basePath)
     {
         if (Path.IsPathRooted(path))
             return path;
@@ -7535,7 +7650,7 @@ internal sealed class DreamService : IHostedService, IDisposable
             "DreamService: repair-ticket creation pass — {Count} cluster(s) without active tickets",
             newClusters.Count);
 
-        var userMsg = BuildRepairTicketCreationPrompt(newClusters);
+        var userMsg = BuildRepairTicketCreationPrompt(newClusters, byPattern);
 
         var result = await InvokeDreamPassAsync<RepairTicketProposalsDto>(
             "repair ticket creation",
@@ -7652,6 +7767,14 @@ internal sealed class DreamService : IHostedService, IDisposable
             logger.LogInformation(
                 "Repair ticket {Id} ({Target}) → {Outcome} → status {Status}",
                 saved.Id, saved.Target, result.Outcome, saved.Status);
+
+            if (saved.Target == RepairTarget.SkillResource)
+            {
+                if (saved.Status == RepairStatus.Resolved)
+                    HostDiagnostics.RepairSkillResourceResolved.Add(1);
+                else if (saved.Status == RepairStatus.Escalated)
+                    HostDiagnostics.RepairSkillResourceEscalated.Add(1);
+            }
         }
 
         if (newlyEscalated && workingMemory is not null)
@@ -7842,7 +7965,9 @@ internal sealed class DreamService : IHostedService, IDisposable
             escalated.Count, options.EscalationWmKey);
     }
 
-    private static string BuildRepairTicketCreationPrompt(IEnumerable<FailureCluster> clusters)
+    internal static string BuildRepairTicketCreationPrompt(
+        IEnumerable<FailureCluster> clusters,
+        IReadOnlyDictionary<string, List<RepairTicket>> priorTicketsByPattern)
     {
         var sb = new StringBuilder();
         sb.AppendLine("The following failure clusters meet the escalation thresholds and have no active repair ticket.");
@@ -7857,6 +7982,17 @@ internal sealed class DreamService : IHostedService, IDisposable
             foreach (var s in c.SampleErrorMessages.Take(3))
             {
                 sb.AppendLine($"   - {Truncate(s, 240)}");
+            }
+            if (priorTicketsByPattern.TryGetValue(SerializeClusterKey(c.Key), out var priors) && priors.Count > 0)
+            {
+                foreach (var prior in priors)
+                {
+                    var op = prior.Change.ValueKind == JsonValueKind.Object
+                             && prior.Change.TryGetProperty("op", out var opProp)
+                        ? opProp.GetString()
+                        : null;
+                    sb.AppendLine($"   prior attempt: {prior.Target} {op ?? "(no op)"} -> {prior.Status}");
+                }
             }
         }
         return sb.ToString();
@@ -7981,6 +8117,10 @@ internal sealed class DreamService : IHostedService, IDisposable
 
         Each cluster shows: server, tool, errorClass (the missing field name or
         'unknown'), count, distinct sessions, and a few sample error messages.
+        A cluster may also show one or more "prior attempt" lines, naming a
+        previous ticket's target, change, and final status for this exact
+        pattern — read these before proposing, they tell you what was already
+        tried and whether it worked.
 
         Choose at most one of these target types per ticket:
           - SkillBody: edit a named skill's body
@@ -7997,6 +8137,21 @@ internal sealed class DreamService : IHostedService, IDisposable
           - PromptBuilderHint: append/replace a hint section in a prompt category file
             ({category, hintId, text}). category is the working-memory namespace
             top-level — typically "session", "patrol", or "subagent".
+          - SkillResource: change a skill resource's trust state or content
+            ({skill, filename, op, content?, type?, description?, verifyHint?}).
+            Triggered by clusters where server="skill-resource" — there, `tool` is the
+            skill name and `errorClass` is the resource filename. `op` is one of:
+              - "demote-provisional": no content change, just re-enters validation.
+                Use this when you have no specific evidence of what is wrong.
+              - "attach": replace the body with corrected content (required: `content`,
+                same `type` as the original unless you have a specific reason to change
+                it). Use this when the sample error messages point at a specific,
+                fixable cause (e.g. a tool schema or fingerprint change named in the
+                errors).
+              - "delete": remove the resource entirely. Only propose this when a prior
+                attempt line for this exact pattern already shows a ticket that reached
+                "Escalated" — i.e. retraining was already tried and failed. Never
+                propose delete as a first response to failure.
 
         Every ticket MUST include a verify shape — a tool call that, when it
         succeeds, proves the cluster has been resolved.
@@ -8017,13 +8172,23 @@ internal sealed class DreamService : IHostedService, IDisposable
         - If verifying a recovery default (ToolDefaultRegister), verify by
           calling the same tool with the OTHER required arguments filled but
           deliberately omitting the field your default fills, expecting Success.
+        - If the target is SkillResource, there is no tool call that proves a
+          "demote-provisional" or "attach" fix worked yet — the resource needs
+          to actually be used again first, which happens on its own schedule.
+          Pick any cheap, reliably-succeeding call (the same kind of health
+          check described above) purely so the ticket resolves instead of
+          churning on Uncertain; do NOT pick a call whose success depends on
+          the resource you just changed. This matters most for "delete": a
+          verify that fails on a deleted resource gets auto-reverted, undoing
+          the deletion — always pick a verify that is unrelated to the removed
+          resource and will reliably succeed.
 
         Output strict JSON in this shape:
         {
           "proposals": [
             {
               "patternKey": "<server>|<tool>|<errorClass>",
-              "target": "SkillBody|WorkingMemoryEvict|ToolDefaultRegister|PromptBuilderHint",
+              "target": "SkillBody|WorkingMemoryEvict|ToolDefaultRegister|PromptBuilderHint|SkillResource",
               "change": { ... target-specific ... },
               "verify": {
                 "server": "...",

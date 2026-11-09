@@ -40,7 +40,8 @@ public sealed class AgentContextBuilder(
     IToolCallLog? toolCallLog = null,
     IOptions<AgentHostOptions>? agentHostOptions = null,
     IOptions<WorkingMemoryOptions>? workingMemoryOptions = null,
-    ISessionWorkRegistry? sessionWorkRegistry = null)
+    ISessionWorkRegistry? sessionWorkRegistry = null,
+    IReflexActivationHooks? reflexHooks = null)
 #pragma warning restore CS9113
 {
     /// <summary>Host options, defaulted when not supplied so existing callers and tests are unaffected.</summary>
@@ -57,6 +58,23 @@ public sealed class AgentContextBuilder(
     private readonly IKnowledgeGraph? _knowledgeGraph = knowledgeGraphProviders.FirstOrDefault();
     private readonly KnowledgeGraphOptions _graphOptions = knowledgeGraphOptions.Value;
     private readonly IEmbeddingGenerator<string, Embedding<float>>? _embeddingGenerator = embeddingGenerators.FirstOrDefault();
+
+    /// <summary>
+    /// Reflex Phase 3: the "(direct: ...)" skill-index suffix naming a skill's validated
+    /// resources that are currently callable as reflex tools. Empty when <see cref="reflexHooks"/>
+    /// is null (reflex tools not installed) or the skill has no such resource.
+    /// </summary>
+    private string FormatReflexSuffix(Skill skill)
+    {
+        if (reflexHooks is null)
+            return "";
+        var names = (skill.Manifest ?? [])
+            .Where(r => r.Type == SkillResourceType.Wisp && !r.Provisional)
+            .Select(r => reflexHooks.TryGetToolName(skill.Name, r.Filename))
+            .Where(n => n is not null)
+            .ToList();
+        return names.Count > 0 ? $" (direct: {string.Join(", ", names)})" : "";
+    }
 
     /// <summary>
     /// The auto-recall text for <paramref name="skill"/>. A code-owned tool guide carries the
@@ -624,7 +642,7 @@ public sealed class AgentContextBuilder(
                         ? "(summary pending)"
                         : s.Summary;
                     var resourceTag = SkillTools.FormatResourceTag(s.Manifest);
-                    return $"- {s.Name}{resourceTag}: {summary}";
+                    return $"- {s.Name}{resourceTag}{FormatReflexSuffix(s)}: {summary}";
                 }));
             chatMessages.Add(new ChatMessage(ChatRole.System, indexText).Tag(ContextCategory.SkillIndex));
             logger.LogInformation("Injected skill index ({Count} skills) for session {SessionId}",
@@ -640,6 +658,19 @@ public sealed class AgentContextBuilder(
             var newSkills = recalledSkills
                 .Where(s => skillRecallTracker.TryMarkAsRecalled(sessionId, s.Name))
                 .ToList();
+
+            // Reflex Phase 3: skill recall is the "touch" signal that pins a skill's validated
+            // reflex tools into this session's activation list — reflex has no mcp_find_tools-style
+            // loader tool call to hook on, so this automatic-injection moment stands in for it.
+            // Pinned under wmNamespace, not the raw sessionId: that's the id the loader tool and
+            // every other registry tool actually carry as their ISessionBoundTool.SessionId (see
+            // sessionNamespace in UserMessageHandler/SubagentRunner/WorkerRunner), so it's the id
+            // GetActivated is ever actually queried with. Every recalled skill is re-pinned on every
+            // turn it's recalled, not only the first (a skill already pinned stays reachable only by
+            // being touched again), in reverse rank order so the best match is pinned last and
+            // survives the pin cap when a turn recalls more skills than it can hold.
+            foreach (var s in recalledSkills.AsEnumerable().Reverse())
+                reflexHooks?.OnSkillSurfaced(wmNamespace, s.Name);
 
             if (newSkills.Count > 0)
             {
@@ -1238,7 +1269,7 @@ public sealed class AgentContextBuilder(
                         ? "(summary pending)"
                         : s.Summary;
                     var resourceTag = SkillTools.FormatResourceTag(s.Manifest);
-                    return $"- {s.Name}{resourceTag}: {summary}";
+                    return $"- {s.Name}{resourceTag}{FormatReflexSuffix(s)}: {summary}";
                 }));
             chatMessages.Add(new ChatMessage(ChatRole.System, indexText).Tag(ContextCategory.SkillIndex));
         }
@@ -1248,6 +1279,11 @@ public sealed class AgentContextBuilder(
             var newSkills = recalledSkills
                 .Where(s => skillRecallTracker.TryMarkAsRecalled(sessionId, s.Name))
                 .ToList();
+            // Pinned under workingMemoryNamespace (e.g. worker/{taskId}), the id the worker's
+            // registry tools actually carry — not sessionId, which here is tracking-only. See the
+            // matching comment on the primary builder's block above.
+            foreach (var s in recalledSkills.AsEnumerable().Reverse())
+                reflexHooks?.OnSkillSurfaced(workingMemoryNamespace, s.Name);
             if (newSkills.Count > 0)
             {
                 var wrapped = new List<(Skill Skill, string Text, string? Companion)>();

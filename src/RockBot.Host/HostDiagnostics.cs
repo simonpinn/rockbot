@@ -393,4 +393,38 @@ public static class HostDiagnostics
             "rockbot.wip.abandoned",
             unit: "{entry}",
             description: "WIP entries abandoned as stale");
+
+    // ── Self-repair: skill-resource retraining (design/reflex-tools.md Phase 1) ─
+
+    /// <summary>
+    /// A provisional skill resource's second consecutive failure was recorded into the
+    /// failure-cluster store for retraining instead of being deleted directly. Recorded in
+    /// <see cref="DreamService.RecordProvisionalFailureAsync"/>.
+    /// </summary>
+    public static readonly Counter<long> RepairSkillResourceFlagged =
+        Meter.CreateCounter<long>(
+            "rockbot.repair.skillresource.flagged",
+            unit: "{resource}",
+            description: "Provisional skill resources flagged for repair instead of deleted directly");
+
+    /// <summary>
+    /// A <see cref="RepairTarget.SkillResource"/> ticket's verify succeeded — the resource
+    /// resumes its normal validation path. Recorded in <see cref="DreamService.RunRepairTicketApplyAsync"/>.
+    /// </summary>
+    public static readonly Counter<long> RepairSkillResourceResolved =
+        Meter.CreateCounter<long>(
+            "rockbot.repair.skillresource.resolved",
+            unit: "{ticket}",
+            description: "SkillResource repair tickets that resolved (verify succeeded)");
+
+    /// <summary>
+    /// A <see cref="RepairTarget.SkillResource"/> ticket exhausted <see cref="RepairTicketOptions.MaxAttempts"/>
+    /// without a successful verify — retraining failed and the resource is now a candidate for real
+    /// deletion. Recorded in <see cref="DreamService.RunRepairTicketApplyAsync"/>.
+    /// </summary>
+    public static readonly Counter<long> RepairSkillResourceEscalated =
+        Meter.CreateCounter<long>(
+            "rockbot.repair.skillresource.escalated",
+            unit: "{ticket}",
+            description: "SkillResource repair tickets escalated after retraining failed repeatedly");
 }

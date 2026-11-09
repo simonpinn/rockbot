@@ -52,6 +52,9 @@ public class ToolProfileSnapshotTests
         R("spawn_worker", "worker"),
         // wisp (WispToolRegistrar)
         R("wisp_execute", "wisp"),
+        // reflex (ReflexToolCatalog, Phase 2) — a direct replay through the same wisp runner
+        // spawn_wisps uses, so it carries wisp's exposure and admitted everywhere wisp already is.
+        R("reflex__x__y", "reflex"),
         // time (TimeToolRegistrar, #685) — pure computation, admitted everywhere
         R("convert_time", "time"),
     ];
@@ -83,6 +86,7 @@ public class ToolProfileSnapshotTests
             "mcp_list_services",
             "mcp_read_resource",
             "read_file",
+            "reflex__x__y",
             "run_script",
             "service_search",
             "spawn_worker",

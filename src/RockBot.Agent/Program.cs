@@ -19,6 +19,7 @@ using RockBot.Observation;
 using RockBot.Skills;
 using RockBot.Tools;
 using RockBot.Tools.Mcp;
+using RockBot.Tools.Reflex;
 using RockBot.A2A;
 using RockBot.ServiceSearch;
 using RockBot.Subagent;
@@ -395,6 +396,14 @@ builder.Services.AddRockBotHost(agent =>
     agent.AddWorkers();
     agent.AddWisps(opts =>
         opts.SharedVolumePath = builder.Configuration["FileSystem:BasePath"] ?? "/rockbot/shared");
+    agent.AddReflexTools(opts => builder.Configuration.GetSection("Reflex").Bind(opts));
+    // Reflex tools join MCP's typed tool surface via a composite (design/reflex-tools.md Phase 3):
+    // the host resolves exactly one ITypedToolSurface per run, so this registration — added after
+    // both AddMcpToolProxy and AddReflexTools above — supersedes AddMcpToolProxy's own direct
+    // McpTypedToolSurface binding without editing McpServiceCollectionExtensions.cs.
+    agent.Services.AddSingleton<ITypedToolSurface>(sp => new CompositeTypedToolSurface(
+        sp.GetRequiredService<McpTypedToolSurface>(),
+        sp.GetRequiredService<ReflexToolSurface>()));
     var a2aBasePath = builder.Configuration["AgentProfile:BasePath"]
         ?? builder.Configuration["AgentProfile__BasePath"]
         ?? AppContext.BaseDirectory;

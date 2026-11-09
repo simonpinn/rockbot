@@ -18,8 +18,8 @@ public class ShapeHashTests
             paramsJson: """{"accountId":"lhotka.net","startDate":"2026-05-20"}""");
 
         Assert.AreEqual(
-            SpawnWispsExecutor.ComputeShapeHash(a),
-            SpawnWispsExecutor.ComputeShapeHash(b),
+            WispReplayPipeline.ComputeShapeHash(a),
+            WispReplayPipeline.ComputeShapeHash(b),
             "Same step shape with different descriptions/values should share a shape hash");
     }
 
@@ -30,8 +30,8 @@ public class ShapeHashTests
         var b = MakeDef("x", """{"accountId":"a","endDate":"d"}""");
 
         Assert.AreNotEqual(
-            SpawnWispsExecutor.ComputeShapeHash(a),
-            SpawnWispsExecutor.ComputeShapeHash(b),
+            WispReplayPipeline.ComputeShapeHash(a),
+            WispReplayPipeline.ComputeShapeHash(b),
             "Different param key sets should produce different shape hashes");
     }
 
@@ -42,8 +42,8 @@ public class ShapeHashTests
         var b = MakeDef("x", """{"q":"v"}""", tool: "search_emails");
 
         Assert.AreNotEqual(
-            SpawnWispsExecutor.ComputeShapeHash(a),
-            SpawnWispsExecutor.ComputeShapeHash(b));
+            WispReplayPipeline.ComputeShapeHash(a),
+            WispReplayPipeline.ComputeShapeHash(b));
     }
 
     [TestMethod]
@@ -53,8 +53,8 @@ public class ShapeHashTests
         var b = MakeDef("x", """{"timeZone":"z","accountId":"a","startDate":"d"}""");
 
         Assert.AreEqual(
-            SpawnWispsExecutor.ComputeShapeHash(a),
-            SpawnWispsExecutor.ComputeShapeHash(b),
+            WispReplayPipeline.ComputeShapeHash(a),
+            WispReplayPipeline.ComputeShapeHash(b),
             "Param key order must not affect the shape hash");
     }
 
@@ -68,12 +68,12 @@ public class ShapeHashTests
         var defJsonB = JsonSerializer.Serialize(b, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
 
         Assert.AreNotEqual(
-            SpawnWispsExecutor.ComputeDefinitionHash(defJsonA),
-            SpawnWispsExecutor.ComputeDefinitionHash(defJsonB),
+            WispReplayPipeline.ComputeDefinitionHash(defJsonA),
+            WispReplayPipeline.ComputeDefinitionHash(defJsonB),
             "Definition hashes should differ across cosmetic/value drift");
         Assert.AreEqual(
-            SpawnWispsExecutor.ComputeShapeHash(a),
-            SpawnWispsExecutor.ComputeShapeHash(b),
+            WispReplayPipeline.ComputeShapeHash(a),
+            WispReplayPipeline.ComputeShapeHash(b),
             "Shape hash must collapse cosmetic/value drift");
     }
 

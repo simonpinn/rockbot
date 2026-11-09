@@ -205,6 +205,7 @@ public class McpServerNamesTests
     [DataRow("todo_mcp")]
     [DataRow("microsoft.learn")]
     [DataRow("A1")]
+    [DataRow("myreflexserver")] // only the exact literal "reflex" is reserved, not names containing it
     public void PlainNames_AreValid(string name) => Assert.IsNull(McpServerNames.Validate(name));
 
     [TestMethod]
@@ -213,6 +214,8 @@ public class McpServerNamesTests
     [DataRow("_leading")]
     [DataRow("has space")]
     [DataRow("slash/name")]
+    [DataRow("reflex")]
+    [DataRow("REFLEX")]
     [DataRow("adjutant__mail")]
     public void OtherNames_AreRejectedWithAReason(string name) => Assert.IsNotNull(McpServerNames.Validate(name));
 

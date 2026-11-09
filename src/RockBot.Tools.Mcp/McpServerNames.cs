@@ -30,6 +30,8 @@ public static partial class McpServerNames
         }
         if (name.Contains(ToolSeparator, StringComparison.Ordinal))
             return $"Server name '{name}' is invalid: it may not contain '{ToolSeparator}', which separates server and tool names.";
+        if (string.Equals(name, "reflex", StringComparison.OrdinalIgnoreCase))
+            return "Server name 'reflex' is reserved for reflex tools and cannot be used.";
         return null;
     }
 

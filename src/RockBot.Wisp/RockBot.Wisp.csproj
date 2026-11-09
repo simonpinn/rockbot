@@ -11,6 +11,8 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="RockBot.Wisp.Tests" />
+    <InternalsVisibleTo Include="RockBot.Tools.Reflex" />
+    <InternalsVisibleTo Include="RockBot.Tools.Reflex.Tests" />
   </ItemGroup>
 
   <ItemGroup>
