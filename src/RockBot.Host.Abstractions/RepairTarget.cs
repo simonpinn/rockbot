@@ -25,4 +25,12 @@ public enum RepairTarget
     /// after observed repeated success.
     /// </summary>
     SkillResource,
+
+    /// <summary>
+    /// Down-weight an x-factor memory's current salience after evidence that it's become a
+    /// blocker rather than a useful signal. See <c>design/cognitive-tiers.md</c>, "X-factor
+    /// memory" — revision is always evidence-driven through this path (or an explicit human
+    /// reset), never a passive decay-over-time.
+    /// </summary>
+    XFactorMemory,
 }

@@ -34,7 +34,8 @@ internal sealed class ScheduledTaskHandler(
     ILogger<ScheduledTaskHandler> logger,
     ISkillUsageStore? skillUsageStore = null,
     IMcpSkillSurface? mcpSkillSurface = null,
-    IOptions<WorkingMemoryOptions>? workingMemoryOptions = null) : IMessageHandler<ScheduledTaskMessage>
+    IOptions<WorkingMemoryOptions>? workingMemoryOptions = null,
+    IFailureClusterStore? failureClusterStore = null) : IMessageHandler<ScheduledTaskMessage>
 {
     public async Task HandleAsync(ScheduledTaskMessage message, MessageHandlerContext context)
     {
@@ -143,6 +144,7 @@ internal sealed class ScheduledTaskHandler(
                 // #685: user-configured automation keeps acting without a fresh request.
                 actionGate: ActionGateScope.ForScheduledTask);
             succeeded = true;
+            await XFactorEvidenceRecorder.RecordIfWaveringAsync(diagnostics, failureClusterStore, sessionId, DateTimeOffset.UtcNow, ct, logger);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {

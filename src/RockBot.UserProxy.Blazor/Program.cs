@@ -30,6 +30,11 @@ builder.Services.AddUserProxy(opts =>
 builder.Services.AddSingleton<IUserFrontend, BlazorUserFrontend>();
 builder.Services.AddSingleton<ChatStateService>();
 
+// Reflex activity panel — a separate, session-less feed (design/cognitive-tiers.md,
+// "Visibility"), independent of ChatStateService/UserProxyService's per-chat-turn state.
+builder.Services.AddSingleton<ReflexActivityStateService>();
+builder.Services.AddHostedService<ReflexActivityProxyService>();
+
 // WorkIQ device-code flow + expired-notification listener. Always registered;
 // the flow itself fails fast with a NotConfigured error if WorkIQ settings
 // are not present in configuration, so deployments without WorkIQ pay only

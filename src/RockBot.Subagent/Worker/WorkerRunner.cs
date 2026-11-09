@@ -42,7 +42,8 @@ internal sealed class WorkerRunner(
     IMessagePublisher publisher,
     AgentIdentity agent,
     AgentProfile agentProfile,
-    ILogger<WorkerRunner> logger) : IWorkerRunner
+    ILogger<WorkerRunner> logger,
+    IFailureClusterStore? failureClusterStore = null) : IWorkerRunner
 {
     /// <summary>
     /// Tool sources that workers never see. Source matches drop the tool from the
@@ -192,6 +193,8 @@ internal sealed class WorkerRunner(
                 diagnostics: diagnostics,
                 cancellationToken: ct);
             isSuccess = true;
+            await XFactorEvidenceRecorder.RecordIfWaveringAsync(
+                diagnostics, failureClusterStore, workerSessionId, DateTimeOffset.UtcNow, ct, logger);
             workerActivity?.SetStatus(ActivityStatusCode.Ok);
         }
         catch (OperationCanceledException)

@@ -78,6 +78,23 @@ public sealed partial class AgentLoopRunner(
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     /// <summary>
+    /// Detects language that questions or hesitates about an instinct/reflex recommendation —
+    /// evidence (design/cognitive-tiers.md, "X-factor memory") that a recalled x-factor memory
+    /// may have become a blocker rather than a useful signal. Unlike the detectors above, a
+    /// match here never nudges or retries; <see cref="ModelBehavior.DetectXFactorWavering"/>
+    /// gates whether it's even checked. A starting-point pattern, deliberately left open to
+    /// tuning against real transcripts rather than frozen.
+    /// </summary>
+    public static readonly Regex XFactorWaveringRegex = new(
+        @"\bI['’]m\s+not\s+(?:fully\s+|entirely\s+|that\s+)?(?:sure|confident)\b" +
+        @"|\bnot\s+entirely\s+sure\b" +
+        @"|\bsecond[- ]guess(?:ing)?\b" +
+        @"|\bhesitant\s+to\s+(?:rely\s+on|trust|use)\b" +
+        @"|\bthis\s+(?:instinct|reflex)\s+(?:might|may)\s+not\s+(?:apply|hold)\b" +
+        @"|\bquestion(?:ing)?\s+(?:whether|if)\s+(?:this|the)\s+(?:reflex|instinct)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
     /// Detects when a follow-up pass produces a refusal or meta-commentary about
     /// the agent's own system instructions, guardrails, or internal rules — content
     /// that should be discarded rather than appended to a good response.
@@ -616,6 +633,14 @@ public sealed partial class AgentLoopRunner(
         if (diagnostics is not null)
             diagnostics.ToolCallLedger = toolCallLedger;
 
+        // Tracks every x-factor recall_x_factor_memory surfaces this run, so a wavering match
+        // (below) can be attributed to the specific memory it was about. See
+        // design/cognitive-tiers.md, "X-factor memory".
+        var xFactorRecallLedger = new XFactorRecallLedger();
+        using var ___________ = XFactorRecallContext.Set(xFactorRecallLedger);
+        if (diagnostics is not null)
+            diagnostics.XFactorRecalls = xFactorRecallLedger;
+
         // #666: the user request this run serves, for tools that start work whose result comes
         // back later (spawn_subagent records it so the synthesis turn is checked against it).
         var servedUserRequest = string.IsNullOrWhiteSpace(originatingUserRequest)
@@ -1063,6 +1088,14 @@ public sealed partial class AgentLoopRunner(
             diagNative.OutputTokens += nativeOutputTokens;
             diagNative.CachedInputTokens += nativeCachedInputTokens;
             diagNative.ModelId = response.ModelId;
+
+            // Pure evidence-gathering, every iteration regardless of tool calls - unlike
+            // HallucinatedActionRegex/CapabilityDenialRegex, this never nudges or retries.
+            if (modelBehavior.DetectXFactorWavering && !string.IsNullOrEmpty(nativeFinalText)
+                && XFactorWaveringRegex.IsMatch(nativeFinalText))
+            {
+                diagNative.WaveringXFactorDetected = true;
+            }
         }
 
         return new LoopResult(nativeFinalText, LoopExitReason.ModelStopped);
@@ -1422,6 +1455,15 @@ public sealed partial class AgentLoopRunner(
                 var preFunctionText = ExtractAssistantText(response);
                 if (!string.IsNullOrWhiteSpace(preFunctionText))
                     diagText.LastAssistantText = preFunctionText;
+
+                // Pure evidence-gathering, every iteration regardless of tool calls - unlike
+                // HallucinatedActionRegex/CapabilityDenialRegex (checked only in the
+                // no-function-calls branch below), this never nudges or retries.
+                if (modelBehavior.DetectXFactorWavering && !string.IsNullOrEmpty(preFunctionText)
+                    && XFactorWaveringRegex.IsMatch(preFunctionText))
+                {
+                    diagText.WaveringXFactorDetected = true;
+                }
             }
 
             var functionCalls = response.Messages

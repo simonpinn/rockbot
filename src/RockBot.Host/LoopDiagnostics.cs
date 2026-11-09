@@ -79,4 +79,20 @@ public sealed class LoopDiagnostics
     /// <c>SubagentRunner</c> carries a compact copy on its result for the synthesis turn's check.
     /// </summary>
     public LoopToolCallLedger? ToolCallLedger { get; set; }
+
+    /// <summary>
+    /// True when <c>ModelBehavior.DetectXFactorWavering</c>'s regex matched the assistant's text
+    /// on any iteration of this run — evidence the model was hesitant about an instinct/reflex
+    /// recommendation. Set, never cleared, by <see cref="AgentLoopRunner.RunAsync"/>; the caller
+    /// checks it after the run returns, same shape as <see cref="ToolCallLedger"/>.
+    /// See <c>design/cognitive-tiers.md</c>, "X-factor memory".
+    /// </summary>
+    public bool WaveringXFactorDetected { get; set; }
+
+    /// <summary>
+    /// Every x-factor memory <c>recall_x_factor_memory</c> surfaced during this run (#683-shaped,
+    /// set once when <see cref="AgentLoopRunner.RunAsync"/> starts), so a caller that also sees
+    /// <see cref="WaveringXFactorDetected"/> knows which x-factor(s) to attribute the evidence to.
+    /// </summary>
+    public XFactorRecallLedger? XFactorRecalls { get; set; }
 }

@@ -4,6 +4,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RockBot.Host;
+using RockBot.Messaging;
 using RockBot.Tools;
 using RockBot.Wisp;
 
@@ -54,7 +55,9 @@ public static class ReflexServiceCollectionExtensions
             sp.GetService<IWispExecutionLog>(),
             sp.GetService<WispDispatchCircuitBreaker>(),
             sp.GetService<IMcpToolDirectory>(),
-            sp.GetRequiredService<ILogger<ReflexExecutor>>()));
+            sp.GetRequiredService<ILogger<ReflexExecutor>>(),
+            sp.GetService<IMessagePublisher>(),
+            sp.GetService<AgentIdentity>()));
 
         if (options.Enabled)
             builder.Services.AddHostedService<ReflexToolRegistrar>();

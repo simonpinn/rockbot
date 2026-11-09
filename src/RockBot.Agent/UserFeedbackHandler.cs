@@ -38,7 +38,8 @@ internal sealed class UserFeedbackHandler(
     ToolGuideTools toolGuideTools,
     IAgentWorkSerializer workSerializer,
     ILogger<UserFeedbackHandler> logger,
-    IMcpSkillSurface? mcpSkillSurface = null) : IMessageHandler<UserFeedback>
+    IMcpSkillSurface? mcpSkillSurface = null,
+    IFailureClusterStore? failureClusterStore = null) : IMessageHandler<UserFeedback>
 {
     public async Task HandleAsync(UserFeedback message, MessageHandlerContext context)
     {
@@ -143,13 +144,17 @@ internal sealed class UserFeedbackHandler(
                              ..rulesTools.Tools, ..toolGuideTools.Tools, ..registryTools]
                 };
 
+                var diagnostics = new LoopDiagnostics();
                 freshResponse = await agentLoopRunner.RunAsync(
                     chatMessages, chatOptions, message.SessionId,
                     enableFollowUp: false, cancellationToken: slot.Token,
                     // #685: a re-answer of the user's own message, gated like the original turn.
                     actionGate: ActionGateScope.ForUserTurn,
                     // #670: the same tool surface as the turn it re-answers.
-                    deferRareTools: true);
+                    deferRareTools: true,
+                    diagnostics: diagnostics);
+                await XFactorEvidenceRecorder.RecordIfWaveringAsync(
+                    diagnostics, failureClusterStore, message.SessionId, DateTimeOffset.UtcNow, slot.Token, logger);
             }
         }
         catch (OperationCanceledException)

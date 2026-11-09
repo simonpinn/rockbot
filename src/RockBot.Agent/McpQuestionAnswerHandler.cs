@@ -45,7 +45,8 @@ internal sealed class McpQuestionAnswerHandler(
     ILogger<McpQuestionAnswerHandler> logger,
     IMcpQuestionAnswerer? answerer = null,
     IMcpSkillSurface? mcpSkillSurface = null,
-    IHostApplicationLifetime? lifetime = null) : IMessageHandler<McpQuestionAnswer>
+    IHostApplicationLifetime? lifetime = null,
+    IFailureClusterStore? failureClusterStore = null) : IMessageHandler<McpQuestionAnswer>
 {
     /// <summary>Who the bookkeeping turns this handler writes are attributed to.</summary>
     internal const string BridgeTurnAgentName = "mcp-bridge";
@@ -219,12 +220,15 @@ internal sealed class McpQuestionAnswerHandler(
                     ReplyTo = $"{UserProxyTopics.UserResponse}.{agent.Name}"
                 });
 
+                var diagnostics = new LoopDiagnostics();
                 finalContent = await agentLoopRunner.RunAsync(
                     chatMessages, chatOptions, sessionId,
                     enableFollowUp: false, cancellationToken: ct,
                     // The user acted: their form answer is a turn of theirs, gated like one.
                     actionGate: ActionGateScope.ForUserTurn,
-                    deferRareTools: true);
+                    deferRareTools: true,
+                    diagnostics: diagnostics);
+                await XFactorEvidenceRecorder.RecordIfWaveringAsync(diagnostics, failureClusterStore, sessionId, DateTimeOffset.UtcNow, ct, logger);
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)

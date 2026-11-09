@@ -33,7 +33,8 @@ internal sealed class LateA2ANotificationHandler(
     SessionClientCapabilityStore clientCapabilityStore,
     SessionOriginStore originStore,
     ILogger<LateA2ANotificationHandler> logger,
-    IMcpSkillSurface? mcpSkillSurface = null) : IMessageHandler<LateA2ANotificationMessage>
+    IMcpSkillSurface? mcpSkillSurface = null,
+    IFailureClusterStore? failureClusterStore = null) : IMessageHandler<LateA2ANotificationMessage>
 {
     private string DisplayName => agentNameHolder.DisplayName ?? agent.Name;
 
@@ -90,9 +91,12 @@ internal sealed class LateA2ANotificationHandler(
                 ReplyTo = $"{UserProxyTopics.UserResponse}.{agent.Name}"
             });
 
+            var diagnostics = new LoopDiagnostics();
             var finalContent = await agentLoopRunner.RunAsync(
                 chatMessages, chatOptions, rawSessionId,
-                enableFollowUp: false, cancellationToken: ct);
+                enableFollowUp: false, cancellationToken: ct,
+                diagnostics: diagnostics);
+            await XFactorEvidenceRecorder.RecordIfWaveringAsync(diagnostics, failureClusterStore, rawSessionId, DateTimeOffset.UtcNow, ct, logger);
 
             await conversationMemory.AddTurnAsync(
                 rawSessionId,

@@ -8152,6 +8152,15 @@ internal sealed class DreamService : IHostedService, IDisposable
                 attempt line for this exact pattern already shows a ticket that reached
                 "Escalated" — i.e. retraining was already tried and failed. Never
                 propose delete as a first response to failure.
+          - XFactorMemory: down-weight an x-factor's current salience
+            ({channel, value, op, factor?}). Triggered by clusters where
+            server="x-factor" — there, `tool` is the channel and `errorClass` is the
+            value. One op: "down-weight" (optional `factor`, a multiplier applied to
+            the current salience; omit to use the configured default). Use this when
+            the cluster's evidence shows thought repeatedly questioning or wavering on
+            an instinct/reflex tied to this x-factor — a sign its current salience is
+            costing more than it protects. There is no "attach"/"delete" for this
+            target: an x-factor memory is never removed outright, only revised.
 
         Every ticket MUST include a verify shape — a tool call that, when it
         succeeds, proves the cluster has been resolved.
@@ -8182,13 +8191,19 @@ internal sealed class DreamService : IHostedService, IDisposable
           verify that fails on a deleted resource gets auto-reverted, undoing
           the deletion — always pick a verify that is unrelated to the removed
           resource and will reliably succeed.
+        - If the target is XFactorMemory, the same reasoning applies as
+          SkillResource above: no tool call proves a down-weight "worked"
+          immediately — the gated pattern has to go unused or stop misfiring
+          over subsequent turns, which the next evidence cycle will show. Pick
+          any cheap, reliably-succeeding verify call unrelated to the gated
+          channel/value.
 
         Output strict JSON in this shape:
         {
           "proposals": [
             {
               "patternKey": "<server>|<tool>|<errorClass>",
-              "target": "SkillBody|WorkingMemoryEvict|ToolDefaultRegister|PromptBuilderHint|SkillResource",
+              "target": "SkillBody|WorkingMemoryEvict|ToolDefaultRegister|PromptBuilderHint|SkillResource|XFactorMemory",
               "change": { ... target-specific ... },
               "verify": {
                 "server": "...",

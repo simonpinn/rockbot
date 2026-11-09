@@ -22,7 +22,8 @@ internal sealed class RockBotTaskHandler(
     IUserActivityMonitor userActivityMonitor,
     ISessionTracker sessionTracker,
     IConversationMemory conversationMemory,
-    ILogger<RockBotTaskHandler> logger) : IAgentTaskHandler
+    ILogger<RockBotTaskHandler> logger,
+    IFailureClusterStore? failureClusterStore = null) : IAgentTaskHandler
 {
     private const string ObserveSystemPrompt =
         """
@@ -179,6 +180,7 @@ internal sealed class RockBotTaskHandler(
         }
 
         // Run read-only LLM pass
+        var diagnostics = new LoopDiagnostics();
         var summary = await agentLoopRunner.RunAsync(
             chatMessages, chatOptions, sessionId,
             tier: ModelTier.Low,
@@ -186,7 +188,9 @@ internal sealed class RockBotTaskHandler(
             enableCompletionEval: false,
             cancellationToken: ct,
             // #685: a task another agent sent in; the gate applies to user-turn runs only.
-            actionGate: ActionGateScope.ForA2AInbound);
+            actionGate: ActionGateScope.ForA2AInbound,
+            diagnostics: diagnostics);
+        await XFactorEvidenceRecorder.RecordIfWaveringAsync(diagnostics, failureClusterStore, sessionId, DateTimeOffset.UtcNow, ct, logger);
 
         // Store turns for future continuation
         await conversationMemory.AddTurnAsync(sessionId,

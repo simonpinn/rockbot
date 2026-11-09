@@ -34,7 +34,8 @@ internal sealed class InputRequiredHandler(
     IAgentTrustStore trustStore,
     AgentNameHolder agentNameHolder,
     ILogger<InputRequiredHandler> logger,
-    IMcpSkillSurface? mcpSkillSurface = null)
+    IMcpSkillSurface? mcpSkillSurface = null,
+    IFailureClusterStore? failureClusterStore = null)
 {
     private string DisplayName => agentNameHolder.DisplayName ?? agent.Name;
     public async Task<InputRequiredResponse> HandleAsync(
@@ -112,9 +113,12 @@ internal sealed class InputRequiredHandler(
                 ReplyTo = $"{UserProxyTopics.UserResponse}.{agent.Name}"
             });
 
+            var diagnostics = new LoopDiagnostics();
             responseText = await agentLoopRunner.RunAsync(
                 chatMessages, chatOptions, rawSessionId,
-                enableFollowUp: false, cancellationToken: ct);
+                enableFollowUp: false, cancellationToken: ct,
+                diagnostics: diagnostics);
+            await XFactorEvidenceRecorder.RecordIfWaveringAsync(diagnostics, failureClusterStore, rawSessionId, DateTimeOffset.UtcNow, ct, logger);
 
             await conversationMemory.AddTurnAsync(
                 rawSessionId,

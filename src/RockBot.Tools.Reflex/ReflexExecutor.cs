@@ -1,7 +1,9 @@
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using RockBot.Host;
+using RockBot.Messaging;
 using RockBot.Tools;
+using RockBot.UserProxy;
 using RockBot.Wisp;
 
 namespace RockBot.Tools.Reflex;
@@ -21,7 +23,9 @@ internal sealed class ReflexExecutor(
     IWispExecutionLog? executionLog,
     WispDispatchCircuitBreaker? circuitBreaker,
     IMcpToolDirectory? mcpToolDirectory,
-    ILogger<ReflexExecutor> logger) : IToolExecutor
+    ILogger<ReflexExecutor> logger,
+    IMessagePublisher? publisher = null,
+    AgentIdentity? agentIdentity = null) : IToolExecutor
 {
     public async Task<ToolInvokeResponse> ExecuteAsync(ToolInvokeRequest request, CancellationToken ct)
     {
@@ -58,38 +62,43 @@ internal sealed class ReflexExecutor(
         var (result, tripped) = await WispReplayPipeline.RunAsync(
             wispExecutor, prepared, wispId, request.SessionId, circuitBreaker, logger, ct);
 
-        if (!tripped && executionLog is not null)
+        if (!tripped)
         {
-            try
+            if (executionLog is not null)
             {
-                var failedStep = result.FailedStep;
-                await executionLog.AppendAsync(new WispExecutionRecord
+                try
                 {
-                    WispId = result.WispId,
-                    Description = result.Definition.Description,
-                    DefinitionHash = prepared.DefinitionHash,
-                    ShapeHash = prepared.ShapeHash,
-                    Succeeded = result.IsSuccess,
-                    StepCount = result.Definition.Steps.Count,
-                    StepsCompleted = result.StepResults.Count(s => s.IsSuccess || s.WasSkipped),
-                    FailedStepId = failedStep?.StepId,
-                    FailedStepIndex = failedStep?.StepIndex,
-                    FailureCategory = failedStep?.Error?.Category.ToString(),
-                    ErrorMessage = failedStep?.Error?.Message,
-                    FailedToolName = failedStep?.Error?.ToolName,
-                    DurationMs = (int)result.Duration.TotalMilliseconds,
-                    Timestamp = DateTimeOffset.UtcNow,
-                    SessionId = request.SessionId,
-                }, ct);
+                    var failedStep = result.FailedStep;
+                    await executionLog.AppendAsync(new WispExecutionRecord
+                    {
+                        WispId = result.WispId,
+                        Description = result.Definition.Description,
+                        DefinitionHash = prepared.DefinitionHash,
+                        ShapeHash = prepared.ShapeHash,
+                        Succeeded = result.IsSuccess,
+                        StepCount = result.Definition.Steps.Count,
+                        StepsCompleted = result.StepResults.Count(s => s.IsSuccess || s.WasSkipped),
+                        FailedStepId = failedStep?.StepId,
+                        FailedStepIndex = failedStep?.StepIndex,
+                        FailureCategory = failedStep?.Error?.Category.ToString(),
+                        ErrorMessage = failedStep?.Error?.Message,
+                        FailedToolName = failedStep?.Error?.ToolName,
+                        DurationMs = (int)result.Duration.TotalMilliseconds,
+                        Timestamp = DateTimeOffset.UtcNow,
+                        SessionId = request.SessionId,
+                    }, ct);
+                }
+                catch (Exception ex)
+                {
+                    // The wisp's work already ran (and may have succeeded) by this point - a
+                    // logging failure must not be reported back as a tool failure, or the agent
+                    // may re-run side effects that already happened. Matches
+                    // SpawnWispsExecutor.LogExecutionAsync's own try/catch around AppendAsync.
+                    logger.LogWarning(ex, "Failed to log reflex execution record for {WispId}", result.WispId);
+                }
             }
-            catch (Exception ex)
-            {
-                // The wisp's work already ran (and may have succeeded) by this point - a
-                // logging failure must not be reported back as a tool failure, or the agent
-                // may re-run side effects that already happened. Matches
-                // SpawnWispsExecutor.LogExecutionAsync's own try/catch around AppendAsync.
-                logger.LogWarning(ex, "Failed to log reflex execution record for {WispId}", result.WispId);
-            }
+
+            await PublishReflexFiredAsync(skillName, filename, result, request, ct);
         }
 
         // One-item batch so a reflex call gets exactly the same #686 outcome reporting and
@@ -109,6 +118,47 @@ internal sealed class ReflexExecutor(
             Content = SpawnWispsExecutor.FormatBatchResult(batch),
             IsError = !result.IsSuccess,
         };
+    }
+
+    /// <summary>
+    /// Best-effort publish of a <see cref="ReflexFiredEvent"/> for the observability panel
+    /// (<c>design/cognitive-tiers.md</c>, "Visibility") — a bus outage here must never fail the
+    /// tool call itself, matching the try/catch convention already used for <c>executionLog</c>
+    /// above. No-op when either dependency wasn't wired (e.g. in tests, or a host that hasn't
+    /// opted into the stimulus/visibility subsystem). <c>Trigger</c> is "stimulus" when this
+    /// call originated from a <c>StimulusDispatcher</c> fire (ambient
+    /// <see cref="StimulusInvocationContext"/> set), "llm" otherwise.
+    /// </summary>
+    private async Task PublishReflexFiredAsync(
+        string skillName, string filename, WispExecutionResult result, ToolInvokeRequest request, CancellationToken ct)
+    {
+        if (publisher is null || agentIdentity is null)
+            return;
+
+        try
+        {
+            var invocation = StimulusInvocationContext.Value;
+            var evt = new ReflexFiredEvent
+            {
+                ToolName = request.ToolName,
+                SkillName = skillName,
+                Filename = filename,
+                Succeeded = result.IsSuccess,
+                FiredAt = DateTimeOffset.UtcNow,
+                DurationMs = (int)result.Duration.TotalMilliseconds,
+                Trigger = invocation is null ? "llm" : "stimulus",
+                SessionId = request.SessionId,
+                StimulusPatternId = invocation?.PatternId,
+                ErrorMessage = result.IsSuccess ? null : result.FailedStep?.Error?.Message,
+                XFactor = invocation?.XFactor,
+            };
+            var envelope = evt.ToEnvelope<ReflexFiredEvent>(source: agentIdentity.Name);
+            await publisher.PublishAsync($"{UserProxyTopics.ReflexFired}.{agentIdentity.Name}", envelope, ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to publish reflex-fired event for {ToolName}", request.ToolName);
+        }
     }
 
     private static ToolInvokeResponse Error(ToolInvokeRequest request, string message) =>
