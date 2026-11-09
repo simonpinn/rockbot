@@ -18,6 +18,16 @@ services:
       timeout: 5s
       retries: 10
 
+  aspire-dashboard:
+    image: mcr.microsoft.com/dotnet/aspire-dashboard:9.0
+    hostname: aspire-dashboard
+    ports:
+      - "18888:18888"   # Dashboard UI — http://localhost:18888
+    environment:
+      # Local dev only: skips the dashboard's login page and accepts OTLP with no
+      # API key. Never set this on a dashboard reachable from outside this host.
+      DOTNET_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS: "true"
+
   agent-init:
     build:
       context: ../..
@@ -91,7 +101,12 @@ services:
         condition: service_healthy
       introspection-mcp:
         condition: service_started
+      aspire-dashboard:
+        condition: service_started
     environment:
+      # -- Telemetry (traces/metrics/logs -> Aspire Dashboard, http://localhost:18888) --
+      Telemetry__Enabled: "true"
+      Telemetry__OtlpEndpoint: http://aspire-dashboard:18889
       # -- RabbitMQ --
       RabbitMq__HostName: rabbitmq
       RabbitMq__Port: "5672"
