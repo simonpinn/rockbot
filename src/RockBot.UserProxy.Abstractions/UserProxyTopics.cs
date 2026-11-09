@@ -34,4 +34,12 @@ public static class UserProxyTopics
     // shared volume and hands back a path reference. The only topic that carries bytes.
     public const string AttachmentUploadRequest = "user.attachment.upload.request";
     public const string AttachmentUploadResponse = "user.attachment.upload.response";
+
+    /// <summary>
+    /// Broadcasts every reflex-tool execution (<see cref="ReflexFiredEvent"/>) — deliberately
+    /// outside the <c>user.*</c>/<c>agent.*</c> families, since a stimulus-triggered fire has no
+    /// owning chat session or agent-info request/response shape. See
+    /// <c>design/cognitive-tiers.md</c>, "Visibility".
+    /// </summary>
+    public const string ReflexFired = "cognition.reflex.fired";
 }

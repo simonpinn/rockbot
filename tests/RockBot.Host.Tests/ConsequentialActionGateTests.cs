@@ -345,7 +345,7 @@ public class ConsequentialActionGateTests
 
     // Shared with ToolCallOutcomeTests (#686).
     internal static AgentLoopRunner CreateRunner(IChatClient model, bool textBased, AgentHostOptions host,
-        IToolCallLog? toolCallLog = null)
+        IToolCallLog? toolCallLog = null, ModelBehavior? behaviorOverride = null)
     {
         var profileOpts = Options.Create(new AgentProfileOptions
         {
@@ -353,7 +353,7 @@ public class ConsequentialActionGateTests
         });
         Directory.CreateDirectory(profileOpts.Value.BasePath);
         var clock = new AgentClock(new ConfigurationBuilder().Build(), profileOpts, NullLogger<AgentClock>.Instance);
-        var behavior = new ModelBehavior { UseTextBasedToolCalling = textBased };
+        var behavior = behaviorOverride ?? new ModelBehavior { UseTextBasedToolCalling = textBased };
         var hostOptions = Options.Create(host);
         var workingMemory = new StubWorkingMemory();
 

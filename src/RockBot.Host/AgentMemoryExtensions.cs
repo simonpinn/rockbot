@@ -293,6 +293,30 @@ public static class AgentMemoryExtensions
     }
 
     /// <summary>
+    /// Registers the x-factor memory store — the persisted sighting history a stimulus
+    /// pattern's x-factor slot consults for novelty. See <c>design/cognitive-tiers.md</c>,
+    /// "X-factor memory".
+    /// </summary>
+    public static AgentHostBuilder WithXFactorMemory(
+        this AgentHostBuilder builder,
+        Action<XFactorMemoryOptions>? configure = null)
+    {
+        if (configure is not null)
+            builder.Services.Configure(configure);
+        else
+            builder.Services.Configure<XFactorMemoryOptions>(_ => { });
+
+        builder.Services.AddSingleton<FileXFactorMemoryStore>();
+        builder.Services.AddSingleton<IXFactorMemoryStore>(sp => sp.GetRequiredService<FileXFactorMemoryStore>());
+        builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<FileXFactorMemoryStore>());
+
+        builder.Services.AddSingleton<XFactorRecallExecutor>();
+        builder.Services.AddSingleton<IHostedService, XFactorToolRegistrar>();
+
+        return builder;
+    }
+
+    /// <summary>
     /// Registers the closed-loop repair-ticket pipeline (Phase 4 self-repair):
     /// the file-backed <see cref="IRepairTicketStore"/>, the four
     /// <see cref="IRepairTargetApplier"/> implementations, and the cache-free
@@ -316,6 +340,7 @@ public static class AgentMemoryExtensions
         builder.Services.AddSingleton<IRepairTargetApplier, WorkingMemoryEvictApplier>();
         builder.Services.AddSingleton<IRepairTargetApplier, ToolDefaultRegisterApplier>();
         builder.Services.AddSingleton<IRepairTargetApplier, PromptBuilderHintApplier>();
+        builder.Services.AddSingleton<IRepairTargetApplier, XFactorMemoryApplier>();
         builder.Services.AddSingleton<IRepairTicketVerifier, RepairTicketVerifier>();
 
         return builder;

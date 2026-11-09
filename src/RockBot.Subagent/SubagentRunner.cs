@@ -43,7 +43,8 @@ internal sealed class SubagentRunner(
     IMcpToolDirectory? mcpToolDirectory = null,
     IEnumerable<ISessionEndListener>? sessionEndListeners = null,
     ISessionWorkRegistry? sessionWorkRegistry = null,
-    IOptions<SubagentOptions>? subagentOptions = null)
+    IOptions<SubagentOptions>? subagentOptions = null,
+    IFailureClusterStore? failureClusterStore = null)
 {
     /// <summary>
     /// The completion-evaluator triggers a subagent's own loop runs on (#686): claims of work it
@@ -278,6 +279,8 @@ internal sealed class SubagentRunner(
                 completionEvalTriggers: SelfCheckTriggers);
             finalOutput = ResponseSanitizer.StripTrailingOffers(finalOutput);
             isSuccess = true;
+            await XFactorEvidenceRecorder.RecordIfWaveringAsync(
+                diagnostics, failureClusterStore, subagentSessionId, DateTimeOffset.UtcNow, ct, logger);
             subagentActivity?.SetStatus(ActivityStatusCode.Ok);
         }
         catch (OperationCanceledException)

@@ -37,7 +37,8 @@ internal sealed class SubagentResultHandler(
     IMcpSkillSurface? mcpSkillSurface = null,
     SessionTierHistory? tierHistory = null,
     ISessionWorkRegistry? sessionWorkRegistry = null,
-    IOptions<AgentHostOptions>? hostOptions = null) : IMessageHandler<SubagentResultMessage>
+    IOptions<AgentHostOptions>? hostOptions = null,
+    IFailureClusterStore? failureClusterStore = null) : IMessageHandler<SubagentResultMessage>
 {
     public async Task HandleAsync(SubagentResultMessage message, MessageHandlerContext context)
     {
@@ -269,6 +270,7 @@ internal sealed class SubagentResultHandler(
 
             // #666: the synthesis is always checked by the completion evaluator, against the
             // user request that led to the spawn — not just the subagent's self-report.
+            var diagnostics = new LoopDiagnostics();
             var finalContent = await agentLoopRunner.RunAsync(
                 chatMessages, chatOptions, rawSessionId,
                 enableFollowUp: false, cancellationToken: ct,
@@ -281,7 +283,9 @@ internal sealed class SubagentResultHandler(
                 // request doesn't become an instruction because a subagent reported back.
                 actionGate: ActionGateScope.FromRelayedResults(batchedResults),
                 // #670: the primary's own tool surface, rare families included only once loaded.
-                deferRareTools: true);
+                deferRareTools: true,
+                diagnostics: diagnostics);
+            await XFactorEvidenceRecorder.RecordIfWaveringAsync(diagnostics, failureClusterStore, rawSessionId, DateTimeOffset.UtcNow, ct, logger);
 
             await conversationMemory.AddTurnAsync(
                 rawSessionId,

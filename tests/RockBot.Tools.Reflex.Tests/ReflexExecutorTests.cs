@@ -1,6 +1,8 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using RockBot.Host;
+using RockBot.Messaging;
 using RockBot.Tools;
+using RockBot.UserProxy;
 using RockBot.Wisp;
 
 namespace RockBot.Tools.Reflex.Tests;
@@ -172,6 +174,115 @@ public class ReflexExecutorTests
         Assert.AreEqual(1, executionLog.Records.Count, "a tripped dispatch must not append a second record");
     }
 
+    private const string FailingWispBody = """
+        {
+          "description": "Calls a tool that isn't registered",
+          "steps": [
+            {
+              "id": "missing",
+              "mode": "direct",
+              "gateway": "web",
+              "tool": "nonexistent_tool",
+              "params": {}
+            }
+          ]
+        }
+        """;
+
+    private static readonly AgentIdentity Agent = new("test-agent");
+
+    [TestMethod]
+    public async Task ExecuteAsync_LlmTriggeredSuccess_PublishesReflexFiredEvent()
+    {
+        var publisher = new FakeMessagePublisher();
+        var lookup = new FakeReflexRegistrationLookup((ToolName, SkillName, Filename));
+        var skillStore = new FakeSkillStore { Bodies = { [(SkillName, Filename)] = ValidWispBody } };
+        var executor = new ReflexExecutor(
+            lookup, skillStore, NewWispExecutor(), executionLog: null, circuitBreaker: null,
+            mcpToolDirectory: null, NullLogger<ReflexExecutor>.Instance, publisher, Agent);
+
+        await executor.ExecuteAsync(NewRequest(), CancellationToken.None);
+
+        var evt = publisher.Published.Single();
+        Assert.AreEqual($"cognition.reflex.fired.{Agent.Name}", evt.Topic);
+        Assert.AreEqual(ToolName, evt.Event.ToolName);
+        Assert.AreEqual(SkillName, evt.Event.SkillName);
+        Assert.AreEqual(Filename, evt.Event.Filename);
+        Assert.IsTrue(evt.Event.Succeeded);
+        Assert.AreEqual("llm", evt.Event.Trigger);
+        Assert.AreEqual("s1", evt.Event.SessionId);
+        Assert.IsNull(evt.Event.StimulusPatternId);
+        Assert.IsNull(evt.Event.ErrorMessage);
+    }
+
+    [TestMethod]
+    public async Task ExecuteAsync_FailingReplay_StillPublishes_SucceededFalse_ErrorMessagePopulated()
+    {
+        var publisher = new FakeMessagePublisher();
+        var lookup = new FakeReflexRegistrationLookup((ToolName, SkillName, Filename));
+        var skillStore = new FakeSkillStore { Bodies = { [(SkillName, Filename)] = FailingWispBody } };
+        var executor = new ReflexExecutor(
+            lookup, skillStore, NewWispExecutor(), executionLog: null, circuitBreaker: null,
+            mcpToolDirectory: null, NullLogger<ReflexExecutor>.Instance, publisher, Agent);
+
+        await executor.ExecuteAsync(NewRequest(), CancellationToken.None);
+
+        var evt = publisher.Published.Single().Event;
+        Assert.IsFalse(evt.Succeeded);
+        Assert.IsFalse(string.IsNullOrEmpty(evt.ErrorMessage));
+    }
+
+    [TestMethod]
+    public async Task ExecuteAsync_StimulusInvocationContextSet_PublishesWithStimulusTriggerAndPatternId()
+    {
+        var publisher = new FakeMessagePublisher();
+        var lookup = new FakeReflexRegistrationLookup((ToolName, SkillName, Filename));
+        var skillStore = new FakeSkillStore { Bodies = { [(SkillName, Filename)] = ValidWispBody } };
+        var executor = new ReflexExecutor(
+            lookup, skillStore, NewWispExecutor(), executionLog: null, circuitBreaker: null,
+            mcpToolDirectory: null, NullLogger<ReflexExecutor>.Instance, publisher, Agent);
+        var invocation = new StimulusInvocation("calendar-transient-retry", "tool.invoke.failed", new Dictionary<string, string>());
+        var request = new ToolInvokeRequest { ToolCallId = "tc-1", ToolName = ToolName, SessionId = null };
+
+        using (StimulusInvocationContext.Set(invocation))
+            await executor.ExecuteAsync(request, CancellationToken.None);
+
+        var evt = publisher.Published.Single().Event;
+        Assert.AreEqual("stimulus", evt.Trigger);
+        Assert.AreEqual("calendar-transient-retry", evt.StimulusPatternId);
+        Assert.IsNull(evt.SessionId, "a stimulus fire has no owning chat session");
+    }
+
+    [TestMethod]
+    public async Task ExecuteAsync_PublisherThrows_StillReturnsNormalResponse()
+    {
+        var lookup = new FakeReflexRegistrationLookup((ToolName, SkillName, Filename));
+        var skillStore = new FakeSkillStore { Bodies = { [(SkillName, Filename)] = ValidWispBody } };
+        var executor = new ReflexExecutor(
+            lookup, skillStore, NewWispExecutor(), executionLog: null, circuitBreaker: null,
+            mcpToolDirectory: null, NullLogger<ReflexExecutor>.Instance, new ThrowingMessagePublisher(), Agent);
+
+        var response = await executor.ExecuteAsync(NewRequest(), CancellationToken.None);
+
+        Assert.IsFalse(response.IsError, response.Content);
+    }
+
+    [TestMethod]
+    public async Task ExecuteAsync_NoPublisherConfigured_DoesNotThrow()
+    {
+        // Every other test in this file already exercises publisher: null implicitly - this
+        // one makes the no-op explicit so the behavior can't regress silently.
+        var lookup = new FakeReflexRegistrationLookup((ToolName, SkillName, Filename));
+        var skillStore = new FakeSkillStore { Bodies = { [(SkillName, Filename)] = ValidWispBody } };
+        var executor = new ReflexExecutor(
+            lookup, skillStore, NewWispExecutor(), executionLog: null, circuitBreaker: null,
+            mcpToolDirectory: null, NullLogger<ReflexExecutor>.Instance, publisher: null, agentIdentity: null);
+
+        var response = await executor.ExecuteAsync(NewRequest(), CancellationToken.None);
+
+        Assert.IsFalse(response.IsError, response.Content);
+    }
+
     private static ToolInvokeRequest NewRequest() =>
         new() { ToolCallId = "tc-1", ToolName = ToolName, SessionId = "s1" };
 
@@ -273,6 +384,29 @@ internal sealed class FakeToolExecutor(string? content = null) : IToolExecutor
 {
     public Task<ToolInvokeResponse> ExecuteAsync(ToolInvokeRequest request, CancellationToken ct) =>
         Task.FromResult(new ToolInvokeResponse { ToolCallId = request.ToolCallId, ToolName = request.ToolName, Content = content });
+}
+
+internal sealed class FakeMessagePublisher : IMessagePublisher
+{
+    public List<(string Topic, ReflexFiredEvent Event)> Published { get; } = [];
+
+    public Task PublishAsync(string topic, MessageEnvelope envelope, CancellationToken cancellationToken = default)
+    {
+        var evt = envelope.GetPayload<ReflexFiredEvent>()
+            ?? throw new InvalidOperationException("expected a ReflexFiredEvent payload");
+        Published.Add((topic, evt));
+        return Task.CompletedTask;
+    }
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+internal sealed class ThrowingMessagePublisher : IMessagePublisher
+{
+    public Task PublishAsync(string topic, MessageEnvelope envelope, CancellationToken cancellationToken = default) =>
+        throw new IOException("simulated bus outage");
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
 
 internal sealed class FakeWorkingMemory : IWorkingMemory

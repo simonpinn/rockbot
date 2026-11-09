@@ -33,7 +33,8 @@ internal sealed class A2ATaskStatusHandler(
     SessionClientCapabilityStore clientCapabilityStore,
     SessionOriginStore originStore,
     ILogger<A2ATaskStatusHandler> logger,
-    IMcpSkillSurface? mcpSkillSurface = null) : IMessageHandler<AgentTaskStatusUpdate>
+    IMcpSkillSurface? mcpSkillSurface = null,
+    IFailureClusterStore? failureClusterStore = null) : IMessageHandler<AgentTaskStatusUpdate>
 {
     private string DisplayName => agentNameHolder.DisplayName ?? agent.Name;
     public async Task HandleAsync(AgentTaskStatusUpdate update, MessageHandlerContext context)
@@ -122,9 +123,12 @@ internal sealed class A2ATaskStatusHandler(
                 ReplyTo = $"{UserProxyTopics.UserResponse}.{agent.Name}"
             });
 
+            var diagnostics = new LoopDiagnostics();
             var finalContent = await agentLoopRunner.RunAsync(
                 chatMessages, chatOptions, rawSessionId,
-                enableFollowUp: false, cancellationToken: ct);
+                enableFollowUp: false, cancellationToken: ct,
+                diagnostics: diagnostics);
+            await XFactorEvidenceRecorder.RecordIfWaveringAsync(diagnostics, failureClusterStore, rawSessionId, DateTimeOffset.UtcNow, ct, logger);
 
             await conversationMemory.AddTurnAsync(
                 rawSessionId,

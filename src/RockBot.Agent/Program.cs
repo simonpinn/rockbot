@@ -20,6 +20,7 @@ using RockBot.Skills;
 using RockBot.Tools;
 using RockBot.Tools.Mcp;
 using RockBot.Tools.Reflex;
+using RockBot.Stimulus;
 using RockBot.A2A;
 using RockBot.ServiceSearch;
 using RockBot.Subagent;
@@ -368,6 +369,7 @@ builder.Services.AddRockBotHost(agent =>
     agent.WithSkills();
     agent.WithKnowledgeGraph();
     agent.WithFailureClusterStore();
+    agent.WithXFactorMemory();
     agent.WithRepairTickets();
     agent.WithDreaming(opts => builder.Configuration.GetSection("Dream").Bind(opts));
     agent.WithMemoryAudit(opts => builder.Configuration.GetSection("MemoryAudit").Bind(opts));
@@ -397,6 +399,7 @@ builder.Services.AddRockBotHost(agent =>
     agent.AddWisps(opts =>
         opts.SharedVolumePath = builder.Configuration["FileSystem:BasePath"] ?? "/rockbot/shared");
     agent.AddReflexTools(opts => builder.Configuration.GetSection("Reflex").Bind(opts));
+    agent.AddStimulusDispatcher(opts => builder.Configuration.GetSection("Stimulus").Bind(opts));
     // Reflex tools join MCP's typed tool surface via a composite (design/reflex-tools.md Phase 3):
     // the host resolves exactly one ITypedToolSurface per run, so this registration — added after
     // both AddMcpToolProxy and AddReflexTools above — supersedes AddMcpToolProxy's own direct

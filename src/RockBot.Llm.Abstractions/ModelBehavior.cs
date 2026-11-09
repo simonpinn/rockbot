@@ -22,6 +22,7 @@ public sealed class ModelBehavior
         NudgeOnHallucinatedToolCalls = true,
         NudgeOnToolFailureGiveup = true,
         NudgeOnMemorySummaryReply = true,
+        DetectXFactorWavering = true,
     };
 
     /// <summary>
@@ -31,6 +32,16 @@ public sealed class ModelBehavior
     /// Addresses hallucination common in DeepSeek and similar models.
     /// </summary>
     public bool NudgeOnHallucinatedToolCalls { get; init; }
+
+    /// <summary>
+    /// When true, scan each iteration's assistant text for language that questions or
+    /// hesitates about an instinct/reflex recommendation (e.g. "I'm not entirely sure",
+    /// "second-guessing this"). Unlike the <c>NudgeOnX</c> flags above, this never injects a
+    /// message or retries — it only records evidence, via the agent host's
+    /// <c>XFactorWaveringRegex</c> detector, that a recalled x-factor memory may have become a
+    /// blocker rather than a useful signal. See <c>design/cognitive-tiers.md</c>, "X-factor memory".
+    /// </summary>
+    public bool DetectXFactorWavering { get; init; }
 
     /// <summary>
     /// Optional extra content appended as a system message on every LLM call, after the
