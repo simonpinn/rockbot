@@ -1,5 +1,8 @@
 using System.Text;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using RockBot.Host;
 using RockBot.Messaging;
 using RockBot.Tools;
@@ -182,6 +185,121 @@ public class StimulusDispatcherTests
     }
 
     [TestMethod]
+    public async Task InboundMessage_XFactorStoreThrowsDuringMatching_StillAcks_DoesNotDeadLetter()
+    {
+        var pattern = NewPattern(reflexTool: "reflex__calendar__retry") with
+        {
+            XFactor = new StimulusXFactorSlot { Channel = "payload:eyes" },
+        };
+        var holder = new StimulusPatternHolder();
+        holder.Update([pattern]);
+        var subscriber = new FakeMessageSubscriber();
+        var dispatcher = new StimulusDispatcher(
+            holder, subscriber, new FakeToolRegistry(), Agent, NullLogger<StimulusDispatcher>.Instance,
+            xFactorStore: new ThrowingXFactorMemoryStore());
+        await dispatcher.StartAsync(CancellationToken.None);
+
+        var envelope = new MessageEnvelope
+        {
+            MessageId = "m1",
+            MessageType = "tool.invoke.failed",
+            Source = "calendar-mcp",
+            Timestamp = DateTimeOffset.UtcNow,
+            Body = new ReadOnlyMemory<byte>(Encoding.UTF8.GetBytes("""{ "eyes": "unknown" }""")),
+        };
+
+        var result = await subscriber.Subscriptions["tool.invoke.failed"].Handler(envelope, CancellationToken.None);
+
+        Assert.AreEqual(MessageResult.Ack, result,
+            "a transient store I/O failure must not dead-letter an otherwise-legitimate bus message");
+    }
+
+    [TestMethod]
+    public async Task InboundMessage_WithinMinIntervalOfLastFire_IsThrottled_StillAcks()
+    {
+        var pattern = NewPattern(reflexTool: "reflex__calendar__retry") with { MinIntervalSeconds = 60 };
+        var holder = new StimulusPatternHolder();
+        holder.Update([pattern]);
+        var subscriber = new FakeMessageSubscriber();
+        var registry = new FakeToolRegistry();
+        var executor = new RecordingToolExecutor();
+        registry.Register(new ToolRegistration { Name = "reflex__calendar__retry", Description = "d", Source = "reflex" }, executor);
+        var dispatcher = NewDispatcher(holder, subscriber, registry);
+        await dispatcher.StartAsync(CancellationToken.None);
+
+        var first = await subscriber.Subscriptions["tool.invoke.failed"].Handler(NewEnvelope(), CancellationToken.None);
+        var second = await subscriber.Subscriptions["tool.invoke.failed"].Handler(NewEnvelope(), CancellationToken.None);
+
+        Assert.AreEqual(MessageResult.Ack, first);
+        Assert.AreEqual(MessageResult.Ack, second, "a throttled message is still legitimate - it's acked, not dead-lettered");
+        Assert.AreEqual(1, executor.Requests.Count, "the second fire within MinIntervalSeconds must be throttled");
+    }
+
+    [TestMethod]
+    public async Task InboundMessage_AfterMinIntervalElapses_FiresAgain()
+    {
+        var pattern = NewPattern(reflexTool: "reflex__calendar__retry") with { MinIntervalSeconds = 0.05 };
+        var holder = new StimulusPatternHolder();
+        holder.Update([pattern]);
+        var subscriber = new FakeMessageSubscriber();
+        var registry = new FakeToolRegistry();
+        var executor = new RecordingToolExecutor();
+        registry.Register(new ToolRegistration { Name = "reflex__calendar__retry", Description = "d", Source = "reflex" }, executor);
+        var dispatcher = NewDispatcher(holder, subscriber, registry);
+        await dispatcher.StartAsync(CancellationToken.None);
+
+        await subscriber.Subscriptions["tool.invoke.failed"].Handler(NewEnvelope(), CancellationToken.None);
+        await Task.Delay(TimeSpan.FromSeconds(0.1));
+        await subscriber.Subscriptions["tool.invoke.failed"].Handler(NewEnvelope(), CancellationToken.None);
+
+        Assert.AreEqual(2, executor.Requests.Count, "once the interval elapses, the pattern must be able to fire again");
+    }
+
+    [TestMethod]
+    public async Task InboundMessage_NoMinIntervalConfigured_FiresEveryTime()
+    {
+        var pattern = NewPattern(reflexTool: "reflex__calendar__retry"); // MinIntervalSeconds null
+        var holder = new StimulusPatternHolder();
+        holder.Update([pattern]);
+        var subscriber = new FakeMessageSubscriber();
+        var registry = new FakeToolRegistry();
+        var executor = new RecordingToolExecutor();
+        registry.Register(new ToolRegistration { Name = "reflex__calendar__retry", Description = "d", Source = "reflex" }, executor);
+        var dispatcher = NewDispatcher(holder, subscriber, registry);
+        await dispatcher.StartAsync(CancellationToken.None);
+
+        await subscriber.Subscriptions["tool.invoke.failed"].Handler(NewEnvelope(), CancellationToken.None);
+        await subscriber.Subscriptions["tool.invoke.failed"].Handler(NewEnvelope(), CancellationToken.None);
+
+        Assert.AreEqual(2, executor.Requests.Count);
+    }
+
+    [TestMethod]
+    public async Task ReconcileAsync_CalledAfterStopAsync_DoesNotResubscribe()
+    {
+        // Simulates the exact race the finding describes: a reload's ReconcileSafelyAsync
+        // queues behind StopAsync's lock, StopAsync wins and clears the subscription map, then
+        // the queued reconcile finally runs. It must see the dispatcher as stopped and do
+        // nothing - not treat every enabled pattern's topic as newly-needed and resubscribe,
+        // leaking a bus subscription for the rest of the process's life.
+        var holder = new StimulusPatternHolder();
+        holder.Update([NewPattern(id: "a", topic: "t1")]);
+        var subscriber = new FakeMessageSubscriber();
+        var dispatcher = NewDispatcher(holder, subscriber, new FakeToolRegistry());
+        await dispatcher.StartAsync(CancellationToken.None);
+        Assert.IsTrue(subscriber.SubscribedTopics.Contains("t1"), "precondition");
+
+        await dispatcher.StopAsync(CancellationToken.None);
+        Assert.IsTrue(subscriber.Subscriptions["t1"].Disposed, "precondition: stop tore down the subscription");
+
+        // The reconcile that "arrives late" after Stop has already completed.
+        await dispatcher.ReconcileAsync(CancellationToken.None);
+
+        Assert.AreEqual(0, subscriber.SubscribedTopics.Count,
+            "a reconcile arriving after Stop must not resubscribe anything");
+    }
+
+    [TestMethod]
     public async Task StopAsync_DisposesAllSubscriptions()
     {
         var holder = new StimulusPatternHolder();
@@ -193,6 +311,61 @@ public class StimulusDispatcherTests
         await dispatcher.StopAsync(CancellationToken.None);
 
         Assert.IsTrue(subscriber.Subscriptions["t1"].Disposed);
+    }
+
+    [TestMethod]
+    public async Task DIResolved_HonorsConfiguredXFactorMemoryOptions_NotBuiltInDefaults()
+    {
+        // StimulusDispatcher's own ctor param is a bare XFactorMemoryOptions; only
+        // IOptions<XFactorMemoryOptions> is ever registered by WithXFactorMemory. If DI can't
+        // bridge that, this falls back to the 24h built-in default recency window regardless
+        // of what's configured - this test configures 1h instead, so a 2h-old sighting must
+        // be read as novel (not blocked) only if the configured value actually made it through.
+        var services = new ServiceCollection();
+        services.Configure<XFactorMemoryOptions>(o => o.DefaultRecencyWindow = TimeSpan.FromHours(1));
+
+        var pattern = NewPattern(reflexTool: "reflex__test__demo") with
+        {
+            XFactor = new StimulusXFactorSlot { Channel = "payload:eyes" },
+        };
+        var holder = new StimulusPatternHolder();
+        holder.Update([pattern]);
+        services.AddSingleton(holder);
+
+        var subscriber = new FakeMessageSubscriber();
+        services.AddSingleton<IMessageSubscriber>(subscriber);
+
+        var executor = new RecordingToolExecutor();
+        var registry = new FakeToolRegistry();
+        registry.Register(new ToolRegistration { Name = "reflex__test__demo", Description = "d", Source = "reflex" }, executor);
+        services.AddSingleton<IToolRegistry>(registry);
+
+        services.AddSingleton(Agent);
+        services.AddSingleton<ILogger<StimulusDispatcher>>(NullLogger<StimulusDispatcher>.Instance);
+
+        var xFactorStore = new FakeXFactorMemoryStore();
+        var key = new XFactorMemoryKey("payload:eyes", "known-set");
+        xFactorStore.Seed(key, count: 3, firstSeen: DateTimeOffset.UtcNow.AddDays(-1),
+            lastSeen: DateTimeOffset.UtcNow.AddHours(-2), weight: 1.0);
+        services.AddSingleton<IXFactorMemoryStore>(xFactorStore);
+
+        using var provider = services.BuildServiceProvider();
+        // The exact resolution mechanism AddHostedService<StimulusDispatcher>() uses internally.
+        var dispatcher = ActivatorUtilities.CreateInstance<StimulusDispatcher>(provider);
+        await dispatcher.StartAsync(CancellationToken.None);
+
+        var envelope = new MessageEnvelope
+        {
+            MessageId = "m1",
+            MessageType = "tool.invoke.failed",
+            Source = "calendar-mcp",
+            Timestamp = DateTimeOffset.UtcNow,
+            Body = new ReadOnlyMemory<byte>(Encoding.UTF8.GetBytes("""{ "eyes": "known-set" }""")),
+        };
+        await subscriber.Subscriptions["tool.invoke.failed"].Handler(envelope, CancellationToken.None);
+
+        Assert.AreEqual(1, executor.Requests.Count,
+            "a 2h-old sighting is novel under the configured 1h window - the configured IOptions value must have reached the dispatcher");
     }
 
     private static async Task WaitForAsync(Func<bool> condition)
@@ -237,6 +410,18 @@ internal sealed class FakeToolRegistry : IToolRegistry
         _tools[registration.Name] = (registration, executor);
 
     public bool Unregister(string toolName) => _tools.Remove(toolName);
+}
+
+internal sealed class ThrowingXFactorMemoryStore : IXFactorMemoryStore
+{
+    public Task<XFactorMemoryRecord?> RecordSightingAsync(XFactorMemoryKey key, DateTimeOffset at, CancellationToken ct = default) =>
+        throw new IOException("simulated store failure");
+    public Task<XFactorMemoryRecord?> TryGetAsync(XFactorMemoryKey key, CancellationToken ct = default) =>
+        throw new IOException("simulated store failure");
+    public Task<IReadOnlyList<XFactorMemoryRecord>> ListAsync(CancellationToken ct = default) =>
+        throw new IOException("simulated store failure");
+    public Task<XFactorMemoryRecord?> AdjustSalienceAsync(XFactorMemoryKey key, double newWeight, CancellationToken ct = default) =>
+        throw new IOException("simulated store failure");
 }
 
 internal sealed class FakeMessageSubscriber : IMessageSubscriber

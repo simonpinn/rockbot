@@ -63,4 +63,8 @@ public sealed class ModelBehaviorEntry
     /// <inheritdoc cref="ModelBehavior.NudgeOnToolFailureGiveup"/>
     /// <remarks>Defaults to true when this entry is absent; nullable so individual entries can opt out.</remarks>
     public bool? NudgeOnToolFailureGiveup { get; set; }
+
+    /// <inheritdoc cref="ModelBehavior.DetectXFactorWavering"/>
+    /// <remarks>Defaults to true when this entry is absent (or doesn't set it); nullable so individual entries can opt out.</remarks>
+    public bool? DetectXFactorWavering { get; set; }
 }

@@ -575,7 +575,7 @@ internal sealed class UserMessageHandler(
                 "Native path complete — final text {TextLen} chars", text.Length);
 
             RecordEscalation(sessionId, turnId, nativeDiag);
-            await XFactorEvidenceRecorder.RecordIfWaveringAsync(nativeDiag, failureClusterStore, sessionId, DateTimeOffset.UtcNow, ct);
+            await XFactorEvidenceRecorder.RecordIfWaveringAsync(nativeDiag, failureClusterStore, sessionId, DateTimeOffset.UtcNow, ct, logger);
 
             _ = tierRoutingLogger.AppendAsync(new TierRoutingEntry
             {
@@ -734,7 +734,7 @@ internal sealed class UserMessageHandler(
                 deferRareTools: true);
 
             RecordEscalation(sessionId, turnId, bgDiag);
-            await XFactorEvidenceRecorder.RecordIfWaveringAsync(bgDiag, failureClusterStore, sessionId, DateTimeOffset.UtcNow, ct);
+            await XFactorEvidenceRecorder.RecordIfWaveringAsync(bgDiag, failureClusterStore, sessionId, DateTimeOffset.UtcNow, ct, logger);
 
             // Routing telemetry written here (terminal point) so the entry carries the
             // multi-iteration aggregate token usage accumulated across the whole loop.

@@ -69,6 +69,35 @@ public class StimulusMatcherXFactorTests
             pattern, "tool.invoke.failed", envelope, store, Options, now, CancellationToken.None);
 
         Assert.IsFalse(result.Matched);
+        Assert.AreEqual(0, result.MatchedChannels.Count,
+            "no named channels on this pattern - nothing was ever resolved to preserve");
+    }
+
+    [TestMethod]
+    public async Task TryMatchAsync_NearMiss_PreservesAlreadyResolvedNamedChannels()
+    {
+        // A sighting was already recorded by the time novelty/weight rejects the match - the
+        // named channels that DID resolve (independent of the x-factor outcome) must still be
+        // visible to a caller that reads MatchedChannels on a near-miss (future diagnostics).
+        var pattern = new StimulusPattern
+        {
+            Id = "p1",
+            Topic = "tool.invoke.failed",
+            ReflexTool = "reflex__calendar__retry",
+            Channels = new Dictionary<string, string> { ["source"] = "calendar-mcp" },
+            XFactor = new StimulusXFactorSlot { Channel = "payload:eyes" },
+        };
+        var store = new FakeXFactorMemoryStore();
+        var now = DateTimeOffset.UtcNow;
+        store.Seed(new XFactorMemoryKey("payload:eyes", "known-set"), count: 3, firstSeen: now.AddDays(-1), lastSeen: now.AddMinutes(-5), weight: 1.0);
+        var envelope = NewEnvelope("""{ "eyes": "known-set" }""");
+
+        var result = await StimulusMatcher.TryMatchAsync(
+            pattern, "tool.invoke.failed", envelope, store, Options, now, CancellationToken.None);
+
+        Assert.IsFalse(result.Matched, "precondition: this is the near-miss case");
+        Assert.AreEqual("calendar-mcp", result.MatchedChannels["source"],
+            "the named channel really did resolve - a near-miss must not discard that");
     }
 
     [TestMethod]

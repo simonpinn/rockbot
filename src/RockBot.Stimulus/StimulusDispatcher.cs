@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using RockBot.Host;
 using RockBot.Messaging;
 using RockBot.Tools;
@@ -25,11 +27,16 @@ internal sealed class StimulusDispatcher(
     AgentIdentity agentIdentity,
     ILogger<StimulusDispatcher> logger,
     IXFactorMemoryStore? xFactorStore = null,
-    XFactorMemoryOptions? xFactorOptions = null) : IHostedService
+    IOptions<XFactorMemoryOptions>? xFactorOptions = null) : IHostedService
 {
     private readonly Dictionary<string, ISubscription> _subscriptionsByTopic = new();
     private readonly SemaphoreSlim _reconcileLock = new(1, 1);
-    private readonly XFactorMemoryOptions _xFactorOptions = xFactorOptions ?? new XFactorMemoryOptions();
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _lastFiredAtByPatternId = new();
+    private bool _stopped;
+    // Only IOptions<XFactorMemoryOptions> is ever registered (by WithXFactorMemory) - a bare
+    // XFactorMemoryOptions ctor param would silently resolve to null via DI and this would
+    // fall back to built-in defaults regardless of what was configured.
+    private readonly XFactorMemoryOptions _xFactorOptions = xFactorOptions?.Value ?? new XFactorMemoryOptions();
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -47,6 +54,11 @@ internal sealed class StimulusDispatcher(
             foreach (var sub in _subscriptionsByTopic.Values)
                 await sub.DisposeAsync();
             _subscriptionsByTopic.Clear();
+            // Set while still holding the lock: a reconcile that was already queued behind
+            // this wait (a reload fired just before shutdown) acquires the lock next, sees
+            // this flag, and bails out instead of resubscribing to an emptied map with
+            // nothing left to ever tear the new subscriptions back down.
+            _stopped = true;
         }
         finally
         {
@@ -71,12 +83,17 @@ internal sealed class StimulusDispatcher(
     /// <summary>
     /// Subscribes to every distinct topic named by an enabled pattern that isn't already
     /// subscribed, and unsubscribes any topic no longer referenced by any enabled pattern.
+    /// Internal (not private) so a test can call it directly to simulate a reconcile that
+    /// arrives after <see cref="StopAsync"/> has already completed.
     /// </summary>
-    private async Task ReconcileAsync(CancellationToken cancellationToken)
+    internal async Task ReconcileAsync(CancellationToken cancellationToken)
     {
         await _reconcileLock.WaitAsync(cancellationToken);
         try
         {
+            if (_stopped)
+                return;
+
             var neededTopics = patternHolder.Patterns
                 .Where(p => p.Enabled)
                 .Select(p => p.Topic)
@@ -108,43 +125,81 @@ internal sealed class StimulusDispatcher(
     {
         foreach (var pattern in patternHolder.Patterns.Where(p => p.Enabled && p.Topic == topic))
         {
-            var match = await StimulusMatcher.TryMatchAsync(
-                pattern, topic, envelope, xFactorStore, _xFactorOptions, DateTimeOffset.UtcNow, ct);
-            if (!match.Matched)
-                continue;
-
-            var executor = toolRegistry.GetExecutor(pattern.ReflexTool);
-            if (executor is null)
-            {
-                logger.LogWarning(
-                    "Stimulus '{PatternId}' matched but its reflex tool '{ReflexTool}' is not registered",
-                    pattern.Id, pattern.ReflexTool);
-                continue;
-            }
-
-            var request = new ToolInvokeRequest
-            {
-                ToolCallId = $"stimulus-{Guid.NewGuid():N}"[..20],
-                ToolName = pattern.ReflexTool,
-                Arguments = null,
-                SessionId = null,
-            };
-
             try
             {
+                // Matching (which may do real store I/O for an x-factor-slotted pattern) and
+                // execution are both inside this try: a transient store failure is exactly as
+                // "not the triggering message's fault" as a failed reflex call below, and must
+                // not dead-letter an otherwise-legitimate bus message either.
+                var match = await StimulusMatcher.TryMatchAsync(
+                    pattern, topic, envelope, xFactorStore, _xFactorOptions, DateTimeOffset.UtcNow, ct);
+                if (!match.Matched)
+                    continue;
+
+                if (IsThrottled(pattern))
+                    continue;
+
+                var executor = toolRegistry.GetExecutor(pattern.ReflexTool);
+                if (executor is null)
+                {
+                    logger.LogWarning(
+                        "Stimulus '{PatternId}' matched but its reflex tool '{ReflexTool}' is not registered",
+                        pattern.Id, pattern.ReflexTool);
+                    continue;
+                }
+
+                var request = new ToolInvokeRequest
+                {
+                    ToolCallId = $"stimulus-{Guid.NewGuid():N}"[..20],
+                    ToolName = pattern.ReflexTool,
+                    Arguments = null,
+                    SessionId = null,
+                };
+
                 var invocation = new StimulusInvocation(pattern.Id, topic, match.MatchedChannels, match.XFactor);
                 using (StimulusInvocationContext.Set(invocation))
                     await executor.ExecuteAsync(request, ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // The triggering bus message is legitimate regardless of whether the reflex
-                // call itself succeeded - that failure is ReflexExecutor's own concern to log
-                // (via IWispExecutionLog), not grounds for a requeue/DLQ storm on this topic.
-                logger.LogWarning(ex, "Stimulus '{PatternId}' fire of '{ReflexTool}' failed", pattern.Id, pattern.ReflexTool);
+                // The triggering bus message is legitimate regardless of whether matching or
+                // the reflex call itself succeeded - that failure is this pattern's own concern
+                // to log, not grounds for a requeue/DLQ storm on this topic.
+                logger.LogWarning(ex, "Stimulus '{PatternId}' evaluation against '{ReflexTool}' failed", pattern.Id, pattern.ReflexTool);
             }
         }
 
         return MessageResult.Ack;
+    }
+
+    /// <summary>
+    /// True when <paramref name="pattern"/> fired within its own <see cref="StimulusPattern.MinIntervalSeconds"/>
+    /// window and must be skipped this time. Atomic per pattern id: a throttled attempt never
+    /// moves the window forward, so a burst of messages arriving faster than the interval can't
+    /// starve the pattern of ever firing again by continually pushing the window out.
+    /// </summary>
+    private bool IsThrottled(StimulusPattern pattern)
+    {
+        if (pattern.MinIntervalSeconds is not { } minIntervalSeconds)
+            return false;
+
+        var now = DateTimeOffset.UtcNow;
+        var minInterval = TimeSpan.FromSeconds(minIntervalSeconds);
+        var throttled = false;
+
+        _lastFiredAtByPatternId.AddOrUpdate(
+            pattern.Id,
+            _ => now,
+            (_, lastFiredAt) =>
+            {
+                if (now - lastFiredAt < minInterval)
+                {
+                    throttled = true;
+                    return lastFiredAt;
+                }
+                return now;
+            });
+
+        return throttled;
     }
 }

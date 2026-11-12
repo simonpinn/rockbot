@@ -64,17 +64,21 @@ internal static class StimulusMatcher
         DateTimeOffset now,
         CancellationToken ct)
     {
+        // A miss here means the named channels themselves never resolved - nothing to preserve.
         if (!TryMatchChannels(pattern, topic, envelope, out var matchedChannels))
             return new StimulusMatchResult(false, EmptyMatch, null);
 
         if (pattern.XFactor is not { } slot)
             return new StimulusMatchResult(true, matchedChannels, null);
 
+        // From here on, matchedChannels already holds real, resolved values - every near-miss
+        // below preserves it rather than discarding to EmptyMatch, since the named channels
+        // genuinely matched regardless of why the x-factor slot didn't.
         if (xFactorStore is null)
-            return new StimulusMatchResult(false, EmptyMatch, null);
+            return new StimulusMatchResult(false, matchedChannels, null);
 
         if (!StimulusChannels.TryResolve(slot.Channel, topic, envelope, out var value) || value is null)
-            return new StimulusMatchResult(false, EmptyMatch, null);
+            return new StimulusMatchResult(false, matchedChannels, null);
 
         var key = new XFactorMemoryKey(slot.Channel, value);
         var prior = await xFactorStore.RecordSightingAsync(key, now, ct);
@@ -87,7 +91,7 @@ internal static class StimulusMatcher
         var passesWeight = currentWeight >= minWeight;
 
         if (!isNovel || !passesWeight)
-            return new StimulusMatchResult(false, EmptyMatch, null);
+            return new StimulusMatchResult(false, matchedChannels, null);
 
         return new StimulusMatchResult(true, matchedChannels, new XFactorContext(slot.Channel, value, currentWeight));
     }

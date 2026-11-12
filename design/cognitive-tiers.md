@@ -1,6 +1,6 @@
 # Cognitive Tiers: Stimulus and Instinct
 
-> **Status:** converged design sketch, establishing shared vocabulary and shape for two concepts that don't exist yet in code. `reflex-tools.md`, `skill-asset-promotion.md`, and `self-repair.md` are unchanged by this document; the next step is an implementation plan.
+> **Status:** implemented — Instinct remains a sketch with no plan of its own, but Stimulus and X-factor memory are built: `StimulusDispatcher`, `FileXFactorMemoryStore`, `XFactorEvidenceRecorder`, and the Blazor `Consciousness.razor` panel all exist in the codebase (`src/RockBot.Stimulus/`, `src/RockBot.Host/`). `reflex-tools.md`, `skill-asset-promotion.md`, and `self-repair.md` remain unchanged by this document.
 
 ## Problem
 
