@@ -43,7 +43,8 @@ internal sealed class WorkerRunner(
     AgentIdentity agent,
     AgentProfile agentProfile,
     ILogger<WorkerRunner> logger,
-    IFailureClusterStore? failureClusterStore = null) : IWorkerRunner
+    IFailureClusterStore? failureClusterStore = null,
+    ISkillUsageStore? skillUsageStore = null) : IWorkerRunner
 {
     /// <summary>
     /// Tool sources that workers never see. Source matches drop the tool from the
@@ -110,6 +111,13 @@ internal sealed class WorkerRunner(
         logger.LogInformation(
             "Worker {TaskId} starting (session {SessionId}, batch {BatchId}, result_key={ResultKey})",
             taskId, workerSessionId, batchId, resultKey);
+
+        // See SkillUsageInheritance: the spawning session usually already looked up the
+        // skill driving this batch, and this worker session would otherwise never record
+        // one of its own — leaving anything it runs (e.g. via spawn_wisps) unattributable
+        // to a promotion target no matter how often it recurs.
+        await SkillUsageInheritance.InheritFromPrimarySessionAsync(
+            skillUsageStore, primarySessionId, workerSessionId, ct);
 
         var systemPrompt = BuildSystemPrompt(taskId, workerNamespace, resultKey);
         var chatMessages = await agentContextBuilder.BuildForWorkerAsync(

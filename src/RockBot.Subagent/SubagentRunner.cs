@@ -92,6 +92,14 @@ internal sealed class SubagentRunner(
             "Subagent {TaskId} starting (session {SessionId}) tier={Tier} (score={Score:F3}) rule={Rule}",
             taskId, subagentSessionId, tier, classification.ComplexityScore, classification.Rule);
 
+        // The orchestrator usually looked the invoking skill up itself and just delegates
+        // execution here — this subagent's own session would otherwise never record one,
+        // leaving DreamService's wisp-success-analysis pass unable to attribute anything
+        // this subagent runs (e.g. via spawn_wisps) to a promotion target, no matter how
+        // often it recurs. See SkillUsageInheritance and design/known-issues.md.
+        await SkillUsageInheritance.InheritFromPrimarySessionAsync(
+            skillUsageStore, primarySessionId, subagentSessionId, ct);
+
         var subagentNamespace = $"subagent/{taskId}";
         var whiteboardCategory = $"subagent-whiteboards/{taskId}";
 

@@ -2,8 +2,10 @@
 @rendermode InteractiveServer
 @attribute [Authorize]
 @using Microsoft.AspNetCore.Authorization
+@using RockBot.UserProxy
 @using RockBot.UserProxy.Blazor.Services
 @inject ReflexActivityStateService Feed
+@inject UserProxyService ProxyService
 @implements IDisposable
 
 <PageTitle>Reflex activity</PageTitle>
@@ -15,6 +17,43 @@
             <span class="small opacity-75">a view onto what is effectively a background consciousness</span>
         </div>
         <a class="btn btn-sm btn-outline-light" href="/">Back to chat</a>
+    </div>
+
+    <div class="p-3 border-bottom bg-light">
+        <h2 class="h6">Dream cycle</h2>
+        <div class="d-flex align-items-center gap-2 mb-2">
+            <button class="btn btn-sm btn-outline-primary" @onclick="RunFullCycleAsync" disabled="@_cycleBusy">
+                Run full cycle now
+            </button>
+            @if (_fullCycleOutcome is not null)
+            {
+                <span class="small text-muted">@_fullCycleOutcome</span>
+            }
+        </div>
+
+        <div class="row g-2 align-items-end">
+            <div class="col-auto">
+                <label class="form-label small mb-0">Target shape hash(es), comma-separated</label>
+                <input class="form-control form-control-sm" style="width: 22rem" @bind="_targetShapeHashes" />
+            </div>
+            <div class="col-auto">
+                <label class="form-label small mb-0">Description contains</label>
+                <input class="form-control form-control-sm" style="width: 16rem" @bind="_descriptionContains" />
+            </div>
+            <div class="col-auto">
+                <label class="form-label small mb-0">Operator hint</label>
+                <input class="form-control form-control-sm" style="width: 22rem" @bind="_operatorHint" />
+            </div>
+            <div class="col-auto">
+                <button class="btn btn-sm btn-outline-primary" @onclick="RunWispAnalysisAsync" disabled="@_cycleBusy">
+                    Run wisp analysis now
+                </button>
+            </div>
+        </div>
+        @if (_wispAnalysisOutcome is not null)
+        {
+            <p class="small text-muted mt-2 mb-0">@_wispAnalysisOutcome</p>
+        }
     </div>
 
     <div class="flex-grow-1 overflow-auto p-3">
@@ -71,11 +110,66 @@
 
 @code {
     private Action? _stateChangedHandler;
+    private bool _cycleBusy;
+    private string? _fullCycleOutcome;
+    private string? _wispAnalysisOutcome;
+    private string _targetShapeHashes = "";
+    private string _descriptionContains = "";
+    private string _operatorHint = "";
 
     protected override void OnInitialized()
     {
         _stateChangedHandler = () => InvokeAsync(StateHasChanged);
         Feed.OnStateChanged += _stateChangedHandler;
+    }
+
+    private async Task RunFullCycleAsync()
+    {
+        _cycleBusy = true;
+        _fullCycleOutcome = null;
+        try
+        {
+            var response = await ProxyService.TriggerDreamCycleAsync();
+            _fullCycleOutcome = response is null
+                ? "No response (timed out or agent unavailable)."
+                : $"{response.Outcome} — a full cycle can take tens of minutes; watch the reflex activity feed and agent logs.";
+        }
+        finally
+        {
+            _cycleBusy = false;
+        }
+    }
+
+    private async Task RunWispAnalysisAsync()
+    {
+        _cycleBusy = true;
+        _wispAnalysisOutcome = null;
+        try
+        {
+            var targets = _targetShapeHashes
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            var request = new WispAnalysisTriggerRequestMessage
+            {
+                TargetShapeHashes = targets.Length > 0 ? targets : null,
+                DescriptionContains = string.IsNullOrWhiteSpace(_descriptionContains) ? null : _descriptionContains,
+                OperatorHint = string.IsNullOrWhiteSpace(_operatorHint) ? null : _operatorHint,
+            };
+
+            var response = await ProxyService.TriggerWispAnalysisAsync(request);
+            _wispAnalysisOutcome = response is null
+                ? "No response (timed out or agent unavailable)."
+                : response.Ran
+                    ? $"Ran — {response.CandidatesAttached} candidate(s) attached; provisional validation: " +
+                      $"{response.ProvisionalPromoted} promoted, {response.ProvisionalFlaggedForRepair} flagged for repair, " +
+                      $"{response.ProvisionalRemoved} removed, {response.ProvisionalMarkedStale} marked stale " +
+                      $"({response.ProvisionalConsidered} considered)."
+                    : $"Did not run: {response.SkippedReason}";
+        }
+        finally
+        {
+            _cycleBusy = false;
+        }
     }
 
     public void Dispose()

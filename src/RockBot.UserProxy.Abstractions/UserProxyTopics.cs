@@ -42,4 +42,12 @@ public static class UserProxyTopics
     /// <c>design/cognitive-tiers.md</c>, "Visibility".
     /// </summary>
     public const string ReflexFired = "cognition.reflex.fired";
+
+    /// <summary>Starts a full on-demand dream cycle (<see cref="DreamCycleTriggerRequest"/>).</summary>
+    public const string DreamCycleTriggerRequest = "cognition.dream.trigger.request";
+    public const string DreamCycleTriggerResponse = "cognition.dream.trigger.response";
+
+    /// <summary>Runs the scoped wisp-success/provisional-validation passes on demand (<see cref="WispAnalysisTriggerRequest"/>).</summary>
+    public const string WispAnalysisTriggerRequest = "cognition.dream.wispAnalysis.request";
+    public const string WispAnalysisTriggerResponse = "cognition.dream.wispAnalysis.response";
 }

@@ -16,7 +16,7 @@ namespace RockBot.Host;
 /// Periodic background service that consolidates the agent's long-term memory corpus —
 /// finding duplicates, merging them into better entries, refining categories, and pruning noise.
 /// </summary>
-internal sealed class DreamService : IHostedService, IDisposable
+internal sealed class DreamService : IHostedService, IDisposable, IDreamCycleTrigger
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -298,6 +298,78 @@ internal sealed class DreamService : IHostedService, IDisposable
         // Leaking the CTS is cheaper than handing that cycle a disposed one.
         if (cycle.IsCompleted)
             _stopping.Dispose();
+    }
+
+    public Task<DreamTriggerOutcome> TriggerFullCycleAsync(CancellationToken ct = default)
+    {
+        if (!_options.Enabled)
+            return Task.FromResult(DreamTriggerOutcome.Disabled);
+
+        lock (_cycleLock)
+        {
+            if (!_cycleTask.IsCompleted)
+                return Task.FromResult(DreamTriggerOutcome.AlreadyRunning);
+
+            // Reuses the same field StopAsync already waits on for an in-flight cycle,
+            // and the same try/catch-and-log shape the timer callback uses — this is an
+            // extra, one-off run; the cron timer's own schedule is untouched.
+            _cycleTask = ManuallyTriggeredCycleAsync();
+        }
+
+        return Task.FromResult(DreamTriggerOutcome.Started);
+    }
+
+    private async Task ManuallyTriggeredCycleAsync()
+    {
+        try
+        {
+            await DreamAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "DreamService: manually triggered dream cycle failed");
+        }
+    }
+
+    public async Task<WispAnalysisTriggerOutcome> TriggerWispAnalysisAsync(
+        WispAnalysisTriggerRequest? request = null, CancellationToken ct = default)
+    {
+        if (!_options.Enabled)
+            return new WispAnalysisTriggerOutcome(Ran: false, SkippedReason: "Dreaming is disabled.");
+
+        IScheduledTaskSlot? slot;
+        try
+        {
+            slot = await _workSerializer.TryAcquireForScheduledAsync(ct);
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or OperationCanceledException)
+        {
+            return new WispAnalysisTriggerOutcome(Ran: false, SkippedReason: "Host is shutting down.");
+        }
+
+        if (slot is null)
+            return new WispAnalysisTriggerOutcome(
+                Ran: false, SkippedReason: "Agent is busy with a live conversation; try again shortly.");
+
+        try
+        {
+            var attached = await RunWispSuccessAnalysisPassAsync(request, slot.Token);
+            var validation = await RunProvisionalValidationPassAsync(slot.Token);
+
+            return new WispAnalysisTriggerOutcome(
+                Ran: true,
+                SkippedReason: null,
+                CandidatesAttached: attached,
+                ProvisionalPromoted: validation.Promoted,
+                ProvisionalFlaggedForRepair: validation.FlaggedForRepair,
+                ProvisionalRemoved: validation.RemovedFallback,
+                ProvisionalMarkedStale: validation.MarkedStale,
+                ProvisionalConsidered: validation.Considered);
+        }
+        finally
+        {
+            await slot.DisposeAsync();
+        }
     }
 
     /// <summary>
@@ -5132,18 +5204,35 @@ internal sealed class DreamService : IHostedService, IDisposable
     /// Promotions land non-provisional because the dream pass operates on observed repetition;
     /// the in-session promotion path (<c>promote_skill_asset</c>) is the one that lands provisional.
     /// </summary>
-    private async Task RunWispSuccessAnalysisPassAsync(CancellationToken ct)
+    private Task RunWispSuccessAnalysisPassAsync(CancellationToken ct) =>
+        RunWispSuccessAnalysisPassAsync(request: null, ct);
+
+    /// <summary>
+    /// <paramref name="request"/> is null on every normal cron-scheduled cycle — this
+    /// overload exists so <see cref="IDreamCycleTrigger.TriggerWispAnalysisAsync"/> can
+    /// run this exact pass on demand, scoped to operator-named candidates, without
+    /// waiting for the next cycle or paying for the other ~15 unrelated passes.
+    /// </summary>
+    private async Task<int> RunWispSuccessAnalysisPassAsync(WispAnalysisTriggerRequest? request, CancellationToken ct)
     {
         if (!_options.WispSuccessAnalysisEnabled || _wispExecutionLog is null || _skillStore is null)
-            return;
+            return 0;
 
+        var attachedCount = 0;
         await RunPassAsync("wisp success analysis", async () =>
         {
             var threshold = Math.Max(1, _options.WispSuccessFrequencyThreshold);
             var records = await _wispExecutionLog.QueryRecentAsync(
                 DateTimeOffset.UtcNow.AddDays(-7), maxResults: 1000);
 
-            if (records.Count < threshold)
+            // An explicit target may name something older or rarer than the normal
+            // window/threshold would ever surface, so the full history is only fetched
+            // when there is one to check against — the normal cycle never pays for it.
+            var allRecords = request is { HasExplicitTargets: true }
+                ? await _wispExecutionLog.QueryRecentAsync(DateTimeOffset.MinValue, maxResults: 5000)
+                : records;
+
+            if (records.Count < threshold && request is not { HasExplicitTargets: true })
             {
                 _logger.LogDebug(
                     "DreamService: wisp success analysis — only {Count} records; skipping",
@@ -5151,17 +5240,7 @@ internal sealed class DreamService : IHostedService, IDisposable
                 return;
             }
 
-            // Group by ShapeHash when present (collapses runs that differ only by
-            // description text or per-run literal values such as dates and account
-            // ids), falling back to DefinitionHash for legacy records written before
-            // the shape hash existed. Keep groups where every recorded run
-            // succeeded and the cumulative count meets the threshold. Tighter than
-            // the failure pass intentionally — we want zero false positives.
-            var groups = records
-                .Where(r => !string.IsNullOrEmpty(r.ShapeHash) || !string.IsNullOrEmpty(r.DefinitionHash))
-                .GroupBy(r => !string.IsNullOrEmpty(r.ShapeHash) ? r.ShapeHash! : r.DefinitionHash)
-                .Where(g => g.Count() >= threshold && g.All(r => r.Succeeded))
-                .ToList();
+            var groups = SelectWispSuccessCandidateGroups(records, allRecords, threshold, request);
 
             if (groups.Count == 0)
             {
@@ -5255,21 +5334,77 @@ internal sealed class DreamService : IHostedService, IDisposable
             foreach (var s in existingSkills.Take(40))
                 userMessage.AppendLine($"  - {s.Name}: {s.Summary}");
 
+            if (!string.IsNullOrWhiteSpace(request?.OperatorHint))
+            {
+                userMessage.AppendLine();
+                userMessage.AppendLine("Additional guidance from the operator for this run:");
+                userMessage.AppendLine(request.OperatorHint);
+            }
+
+            // A manual trigger (request is not null) always runs the LLM call — the
+            // operator asked for this right now, which overrides the "inputs unchanged
+            // since last time" heuristic the unattended cron cycle relies on.
             var result = await InvokeDreamPassAsync<WispSuccessAnalysisResultDto>(
                 "wisp success analysis",
                 _wispSuccessDirective ?? BuiltInWispSuccessDirective,
                 userMessage.ToString(),
                 ct,
-                EventWatermarkFingerprint(records.Select(r => r.Timestamp)));
+                request is null ? EventWatermarkFingerprint(records.Select(r => r.Timestamp)) : null);
             if (result is null) return;
 
             var attached = await ApplyWispSuccessPromotionsAsync(
                 _skillStore, candidates, existingSkillNames, result.Promotions, _logger, ct, _mcpToolDirectory);
+            attachedCount = attached;
 
             _logger.LogInformation(
                 "DreamService: wisp success analysis pass complete — {Attached}/{Total} promotions attached",
                 attached, result.Promotions?.Count ?? 0);
         });
+        return attachedCount;
+    }
+
+    /// <summary>
+    /// Candidate-group selection extracted so the explicit-target bypass is testable
+    /// without standing up the full DreamService + LLM stack (mirrors
+    /// <see cref="ApplyWispSuccessPromotionsAsync"/>'s own reason for being a static
+    /// helper). Groups by ShapeHash when present (collapses runs that differ only by
+    /// description text or per-run literal values such as dates and account ids),
+    /// falling back to DefinitionHash for legacy records written before the shape hash
+    /// existed. A group normally needs every recorded run to have succeeded and the
+    /// cumulative count to meet <paramref name="threshold"/> — tighter than the failure
+    /// pass intentionally, since zero false positives matters more here than recall.
+    /// When <paramref name="request"/> names an explicit target (by shape hash or a
+    /// description substring), that target's group is added from
+    /// <paramref name="allRecords"/> even if it would not otherwise meet the threshold
+    /// or fall inside <paramref name="recentRecords"/>' window — but it still must have
+    /// every recorded run succeed; volume and age are what gets bypassed, not
+    /// correctness.
+    /// </summary>
+    internal static IReadOnlyList<IGrouping<string, WispExecutionRecord>> SelectWispSuccessCandidateGroups(
+        IReadOnlyList<WispExecutionRecord> recentRecords,
+        IReadOnlyList<WispExecutionRecord> allRecords,
+        int threshold,
+        WispAnalysisTriggerRequest? request)
+    {
+        var byHash = recentRecords
+            .Where(r => !string.IsNullOrEmpty(r.ShapeHash) || !string.IsNullOrEmpty(r.DefinitionHash))
+            .GroupBy(r => !string.IsNullOrEmpty(r.ShapeHash) ? r.ShapeHash! : r.DefinitionHash)
+            .Where(g => g.Count() >= threshold && g.All(r => r.Succeeded))
+            .ToDictionary(g => g.Key!, g => g);
+
+        if (request is { HasExplicitTargets: true })
+        {
+            var targeted = allRecords
+                .Where(r => !string.IsNullOrEmpty(r.ShapeHash) || !string.IsNullOrEmpty(r.DefinitionHash))
+                .GroupBy(r => !string.IsNullOrEmpty(r.ShapeHash) ? r.ShapeHash! : r.DefinitionHash)
+                .Where(g => g.All(r => r.Succeeded)
+                    && request.MatchesTarget(g.Key!, g.First().Description));
+
+            foreach (var group in targeted)
+                byHash[group.Key!] = group;
+        }
+
+        return byHash.Values.ToList();
     }
 
     /// <summary>
@@ -5520,11 +5655,12 @@ internal sealed class DreamService : IHostedService, IDisposable
         };
     }
 
-    private async Task RunProvisionalValidationPassAsync(CancellationToken ct)
+    private async Task<ProvisionalValidationOutcome> RunProvisionalValidationPassAsync(CancellationToken ct)
     {
         if (!_options.ProvisionalValidationEnabled || _skillStore is null || _wispExecutionLog is null)
-            return;
+            return new ProvisionalValidationOutcome(0, 0, 0, 0, 0);
 
+        var outcome = new ProvisionalValidationOutcome(0, 0, 0, 0, 0);
         await RunPassAsync("provisional resource validation", async () =>
         {
             var skills = await _skillStore.ListAsync();
@@ -5647,8 +5783,14 @@ internal sealed class DreamService : IHostedService, IDisposable
             _logger.LogInformation(
                 "DreamService: provisional validation pass complete — {Promoted} promoted, {FlaggedForRepair} flagged for repair, {RemovedFallback} removed directly (repair loop unavailable), {Stale} marked stale ({Total} considered)",
                 promoted, flaggedForRepair, removedFallback, staled, provisional.Count);
+
+            outcome = new ProvisionalValidationOutcome(promoted, flaggedForRepair, removedFallback, staled, provisional.Count);
         });
+        return outcome;
     }
+
+    internal sealed record ProvisionalValidationOutcome(
+        int Promoted, int FlaggedForRepair, int RemovedFallback, int MarkedStale, int Considered);
 
     /// <summary>
     /// Records a provisional resource's failure into the failure-cluster store using

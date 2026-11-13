@@ -32,6 +32,8 @@ public sealed class UserProxyService(
     private readonly ConcurrentDictionary<string, TaskCompletionSource<DeleteSavedResponseAck>> _pendingDeleteSaved = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<ActiveStatusResponse>> _pendingActiveStatus = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<AttachmentUploadResponse>> _pendingUpload = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<DreamCycleTriggerResponse>> _pendingDreamTrigger = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<WispAnalysisTriggerResponseMessage>> _pendingWispAnalysisTrigger = new();
     private ISubscription? _subscription;
     private ISubscription? _p2pSubscription;
     private ISubscription? _historySubscription;
@@ -42,6 +44,8 @@ public sealed class UserProxyService(
     private ISubscription? _getSavedSubscription;
     private ISubscription? _deleteSavedSubscription;
     private ISubscription? _uploadSubscription;
+    private ISubscription? _dreamTriggerSubscription;
+    private ISubscription? _wispAnalysisTriggerSubscription;
     private bool _historyInitialized;
     private bool _agentInfoInitialized;
     private bool _saveResponseInitialized;
@@ -50,6 +54,8 @@ public sealed class UserProxyService(
     private bool _deleteSavedInitialized;
     private bool _activeStatusInitialized;
     private bool _uploadInitialized;
+    private bool _dreamTriggerInitialized;
+    private bool _wispAnalysisTriggerInitialized;
     private readonly SemaphoreSlim _historyInitLock = new(1, 1);
     private readonly SemaphoreSlim _agentInfoInitLock = new(1, 1);
     private readonly SemaphoreSlim _activeStatusInitLock = new(1, 1);
@@ -58,6 +64,8 @@ public sealed class UserProxyService(
     private readonly SemaphoreSlim _getSavedInitLock = new(1, 1);
     private readonly SemaphoreSlim _deleteSavedInitLock = new(1, 1);
     private readonly SemaphoreSlim _uploadInitLock = new(1, 1);
+    private readonly SemaphoreSlim _dreamTriggerInitLock = new(1, 1);
+    private readonly SemaphoreSlim _wispAnalysisTriggerInitLock = new(1, 1);
     private CancellationTokenSource? _cts;
 
     public bool IsConnected { get; private set; }
@@ -266,6 +274,18 @@ public sealed class UserProxyService(
                 tcs.TrySetCanceled();
         }
 
+        foreach (var kvp in _pendingDreamTrigger)
+        {
+            if (_pendingDreamTrigger.TryRemove(kvp.Key, out var tcs))
+                tcs.TrySetCanceled();
+        }
+
+        foreach (var kvp in _pendingWispAnalysisTrigger)
+        {
+            if (_pendingWispAnalysisTrigger.TryRemove(kvp.Key, out var tcs))
+                tcs.TrySetCanceled();
+        }
+
         if (_subscription is not null)
             await _subscription.DisposeAsync();
 
@@ -292,6 +312,12 @@ public sealed class UserProxyService(
 
         if (_deleteSavedSubscription is not null)
             await _deleteSavedSubscription.DisposeAsync();
+
+        if (_dreamTriggerSubscription is not null)
+            await _dreamTriggerSubscription.DisposeAsync();
+
+        if (_wispAnalysisTriggerSubscription is not null)
+            await _wispAnalysisTriggerSubscription.DisposeAsync();
 
         if (_uploadSubscription is not null)
             await _uploadSubscription.DisposeAsync();
@@ -838,6 +864,237 @@ public sealed class UserProxyService(
 
         logger.LogDebug("Active status response correlated for {CorrelationId}: {SubagentCount} subagents, isProcessing={IsProcessing}",
             envelope.CorrelationId, response.Subagents.Count, response.IsProcessing);
+
+        return Task.FromResult(MessageResult.Ack);
+    }
+
+    // ── Dream cycle trigger ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Asks the agent to start a full dream cycle now, outside its cron schedule.
+    /// Fire-and-forget on the agent's side (a full cycle commonly takes tens of
+    /// minutes) — this call itself returns as soon as the agent confirms whether it
+    /// started. Returns null if the request times out or the agent is unavailable.
+    /// </summary>
+    public async Task<DreamCycleTriggerResponse?> TriggerDreamCycleAsync(
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        var effectiveTimeout = timeout ?? options.DefaultReplyTimeout;
+        var correlationId = Guid.NewGuid().ToString("N");
+        var tcs = new TaskCompletionSource<DreamCycleTriggerResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        _pendingDreamTrigger[correlationId] = tcs;
+
+        try
+        {
+            await EnsureDreamTriggerSubscribedAsync(cancellationToken);
+
+            var request = new DreamCycleTriggerRequest();
+            var envelope = request.ToEnvelope<DreamCycleTriggerRequest>(
+                source: options.ProxyId,
+                correlationId: correlationId,
+                replyTo: DreamTriggerResponseTopic);
+
+            await publisher.PublishAsync($"{UserProxyTopics.DreamCycleTriggerRequest}.{options.AgentName}", envelope, cancellationToken);
+
+            logger.LogDebug("Published DreamCycleTriggerRequest {CorrelationId}", correlationId);
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(effectiveTimeout);
+
+            try
+            {
+                return await tcs.Task.WaitAsync(timeoutCts.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                logger.LogWarning("Dream cycle trigger timeout for correlation {CorrelationId} after {Timeout}",
+                    correlationId, effectiveTimeout);
+                return null;
+            }
+        }
+        finally
+        {
+            _pendingDreamTrigger.TryRemove(correlationId, out _);
+        }
+    }
+
+    private string DreamTriggerResponseTopic => $"{UserProxyTopics.DreamCycleTriggerResponse}.{options.ProxyId}";
+
+    private async Task EnsureDreamTriggerSubscribedAsync(CancellationToken ct)
+    {
+        if (_dreamTriggerInitialized) return;
+
+        await _dreamTriggerInitLock.WaitAsync(ct);
+        try
+        {
+            if (_dreamTriggerInitialized) return;
+
+            _dreamTriggerSubscription = await subscriber.SubscribeAsync(
+                DreamTriggerResponseTopic,
+                $"user-proxy.{options.ProxyId}.dream-trigger",
+                HandleDreamTriggerResponseAsync,
+                QueueOptions,
+                ct);
+
+            _dreamTriggerInitialized = true;
+        }
+        finally
+        {
+            _dreamTriggerInitLock.Release();
+        }
+    }
+
+    internal Task<MessageResult> HandleDreamTriggerResponseAsync(MessageEnvelope envelope, CancellationToken ct)
+    {
+        if (envelope.CorrelationId is null ||
+            !_pendingDreamTrigger.TryGetValue(envelope.CorrelationId, out var tcs))
+        {
+            logger.LogWarning("Received dream trigger response with unknown correlation ID: {CorrelationId}",
+                envelope.CorrelationId);
+            return Task.FromResult(MessageResult.Ack);
+        }
+
+        DreamCycleTriggerResponse? response;
+        try
+        {
+            response = envelope.GetPayload<DreamCycleTriggerResponse>();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to deserialize DreamCycleTriggerResponse");
+            tcs.TrySetException(ex);
+            return Task.FromResult(MessageResult.DeadLetter);
+        }
+
+        if (response is null)
+        {
+            logger.LogWarning("Received null DreamCycleTriggerResponse");
+            return Task.FromResult(MessageResult.DeadLetter);
+        }
+
+        _pendingDreamTrigger.TryRemove(envelope.CorrelationId, out _);
+        tcs.TrySetResult(response);
+
+        logger.LogDebug("Dream trigger response correlated for {CorrelationId}: outcome={Outcome}",
+            envelope.CorrelationId, response.Outcome);
+
+        return Task.FromResult(MessageResult.Ack);
+    }
+
+    // ── Wisp analysis trigger ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Asks the agent to run the wisp-success-analysis and provisional-validation
+    /// passes now, scoped by <paramref name="request"/>, and awaits the result. Fast
+    /// — unlike <see cref="TriggerDreamCycleAsync"/>, this is the normal awaited
+    /// request/response shape, since the scoped passes run in seconds, not minutes.
+    /// Returns null if the request times out or the agent is unavailable.
+    /// </summary>
+    public async Task<WispAnalysisTriggerResponseMessage?> TriggerWispAnalysisAsync(
+        WispAnalysisTriggerRequestMessage? request = null,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        var effectiveTimeout = timeout ?? options.DefaultReplyTimeout;
+        var correlationId = Guid.NewGuid().ToString("N");
+        var tcs = new TaskCompletionSource<WispAnalysisTriggerResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        _pendingWispAnalysisTrigger[correlationId] = tcs;
+
+        try
+        {
+            await EnsureWispAnalysisTriggerSubscribedAsync(cancellationToken);
+
+            var envelope = (request ?? new WispAnalysisTriggerRequestMessage()).ToEnvelope<WispAnalysisTriggerRequestMessage>(
+                source: options.ProxyId,
+                correlationId: correlationId,
+                replyTo: WispAnalysisTriggerResponseTopic);
+
+            await publisher.PublishAsync($"{UserProxyTopics.WispAnalysisTriggerRequest}.{options.AgentName}", envelope, cancellationToken);
+
+            logger.LogDebug("Published WispAnalysisTriggerRequestMessage {CorrelationId}", correlationId);
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(effectiveTimeout);
+
+            try
+            {
+                return await tcs.Task.WaitAsync(timeoutCts.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                logger.LogWarning("Wisp analysis trigger timeout for correlation {CorrelationId} after {Timeout}",
+                    correlationId, effectiveTimeout);
+                return null;
+            }
+        }
+        finally
+        {
+            _pendingWispAnalysisTrigger.TryRemove(correlationId, out _);
+        }
+    }
+
+    private string WispAnalysisTriggerResponseTopic => $"{UserProxyTopics.WispAnalysisTriggerResponse}.{options.ProxyId}";
+
+    private async Task EnsureWispAnalysisTriggerSubscribedAsync(CancellationToken ct)
+    {
+        if (_wispAnalysisTriggerInitialized) return;
+
+        await _wispAnalysisTriggerInitLock.WaitAsync(ct);
+        try
+        {
+            if (_wispAnalysisTriggerInitialized) return;
+
+            _wispAnalysisTriggerSubscription = await subscriber.SubscribeAsync(
+                WispAnalysisTriggerResponseTopic,
+                $"user-proxy.{options.ProxyId}.wisp-analysis-trigger",
+                HandleWispAnalysisTriggerResponseAsync,
+                QueueOptions,
+                ct);
+
+            _wispAnalysisTriggerInitialized = true;
+        }
+        finally
+        {
+            _wispAnalysisTriggerInitLock.Release();
+        }
+    }
+
+    internal Task<MessageResult> HandleWispAnalysisTriggerResponseAsync(MessageEnvelope envelope, CancellationToken ct)
+    {
+        if (envelope.CorrelationId is null ||
+            !_pendingWispAnalysisTrigger.TryGetValue(envelope.CorrelationId, out var tcs))
+        {
+            logger.LogWarning("Received wisp analysis trigger response with unknown correlation ID: {CorrelationId}",
+                envelope.CorrelationId);
+            return Task.FromResult(MessageResult.Ack);
+        }
+
+        WispAnalysisTriggerResponseMessage? response;
+        try
+        {
+            response = envelope.GetPayload<WispAnalysisTriggerResponseMessage>();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to deserialize WispAnalysisTriggerResponseMessage");
+            tcs.TrySetException(ex);
+            return Task.FromResult(MessageResult.DeadLetter);
+        }
+
+        if (response is null)
+        {
+            logger.LogWarning("Received null WispAnalysisTriggerResponseMessage");
+            return Task.FromResult(MessageResult.DeadLetter);
+        }
+
+        _pendingWispAnalysisTrigger.TryRemove(envelope.CorrelationId, out _);
+        tcs.TrySetResult(response);
+
+        logger.LogDebug("Wisp analysis trigger response correlated for {CorrelationId}: ran={Ran} attached={Attached}",
+            envelope.CorrelationId, response.Ran, response.CandidatesAttached);
 
         return Task.FromResult(MessageResult.Ack);
     }
