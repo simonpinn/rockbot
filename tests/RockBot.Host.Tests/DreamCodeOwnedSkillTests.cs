@@ -144,6 +144,127 @@ public class DreamCodeOwnedSkillTests
         Assert.AreEqual("# Improved plan", (await store.GetAsync("plan-meeting"))!.Content);
     }
 
+    // ── Resource preservation across rename/delete ────────────────────────────
+
+    [TestMethod]
+    public async Task Consolidation_ResourceBearingSourceOmittedFromSourceNames_IsKeptNotDeleted()
+    {
+        // The optimize/consolidate directives both tell the LLM to "list the original skill
+        // name in sourceNames to trigger replacement" — but if it forgets, WithoutCodeOwnedSkills
+        // still adds the old name to the delete set (explicit toDelete), and nothing captures
+        // its resources. Without the guard this destroys the wisp along with the skill.
+        var oldSkill = PlainWithResource("trello-digest", "# Old content", "summary-wisp.json");
+        var store = await StoreWith(oldSkill, Plain("other-skill", "# unrelated"));
+        var llm = new ScriptedLlmClient("""
+            {
+              "toDelete": ["trello-digest"],
+              "toSave": [ { "name": "trello-digest-v2", "summary": "s", "content": "# New content" } ]
+            }
+            """);
+
+        await CreateService(store, llm, providers: []).ConsolidateSkillsAsync(CancellationToken.None);
+
+        var kept = await store.GetAsync("trello-digest");
+        Assert.IsNotNull(kept, "a resource-bearing source not named in any replacement's sourceNames must survive");
+        Assert.AreEqual(1, kept!.Manifest!.Count);
+        Assert.AreEqual("summary-wisp.json", kept.Manifest[0].Filename);
+        // The LLM's intended replacement still saves — only the data-destroying delete is blocked.
+        Assert.IsNotNull(await store.GetAsync("trello-digest-v2"));
+    }
+
+    [TestMethod]
+    public async Task Consolidation_ResourceBearingSourceNamedInSourceNames_IsDeletedAndCaptured()
+    {
+        var oldSkill = PlainWithResource("trello-digest", "# Old content", "summary-wisp.json");
+        var store = await StoreWith(oldSkill, Plain("other-skill", "# unrelated"));
+        var llm = new ScriptedLlmClient("""
+            {
+              "toDelete": [],
+              "toSave": [ { "name": "trello-digest-v2", "summary": "s", "content": "# New content",
+                            "sourceNames": ["trello-digest"] } ]
+            }
+            """);
+
+        await CreateService(store, llm, providers: []).ConsolidateSkillsAsync(CancellationToken.None);
+
+        Assert.IsNull(await store.GetAsync("trello-digest"), "a properly-accounted-for source is still deleted");
+        Assert.IsNotNull(await store.GetAsync("trello-digest-v2"));
+    }
+
+    [TestMethod]
+    public async Task Optimize_ResourceBearingSkillOmittedFromSourceNames_IsKeptNotDeleted()
+    {
+        var original = PlainWithResource("trello-digest", "# Old content", "summary-wisp.json");
+        var store = await StoreWith(original);
+        var usage = new StubSkillUsageStore(
+            new SkillInvocationEvent("e1", "trello-digest", "s1", DateTimeOffset.UtcNow.AddHours(-2)));
+        var feedback = new StubFeedbackStore(
+            new FeedbackEntry("f1", "s1", FeedbackSignalType.Correction, "wrong", null, DateTimeOffset.UtcNow.AddHours(-1)));
+        var llm = new ScriptedLlmClient("""
+            {
+              "toDelete": ["trello-digest"],
+              "toSave": [ { "name": "trello-digest-renamed", "content": "# Improved content" } ]
+            }
+            """);
+
+        var service = CreateService(store, llm, providers: [], usage: usage, feedback: feedback);
+        await service.OptimizeSkillsAsync(CancellationToken.None);
+
+        var kept = await store.GetAsync("trello-digest");
+        Assert.IsNotNull(kept, "the old name must survive since its replacement never named it as a source");
+        Assert.AreEqual(1, kept!.Manifest!.Count);
+    }
+
+    [TestMethod]
+    public void ProtectResourceBearingDeletes_NoResources_IsNotProtected()
+    {
+        var toDelete = new HashSet<string>(["a"], StringComparer.OrdinalIgnoreCase);
+        var manifests = new Dictionary<string, IReadOnlyList<SkillResource>?> { ["a"] = null };
+
+        var result = DreamService.ProtectResourceBearingDeletes(
+            toDelete, toSave: [], manifests, "test pass", Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+
+        CollectionAssert.AreEqual(new[] { "a" }, result.ToArray());
+    }
+
+    [TestMethod]
+    public void ProtectResourceBearingDeletes_HasResourcesAndIsASource_IsNotProtected()
+    {
+        var toDelete = new HashSet<string>(["a"], StringComparer.OrdinalIgnoreCase);
+        var manifests = new Dictionary<string, IReadOnlyList<SkillResource>?>
+        {
+            ["a"] = [new SkillResource("r.json", SkillResourceType.Wisp, "d", CreatedAt: Old, DefinitionHash: "h")],
+        };
+        var toSave = new List<DreamService.SkillDreamEntryDto>
+        {
+            new("b", "s", "# b", SourceNames: ["a"], SeeAlso: null),
+        };
+
+        var result = DreamService.ProtectResourceBearingDeletes(
+            toDelete, toSave, manifests, "test pass", Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+
+        CollectionAssert.AreEqual(new[] { "a" }, result.ToArray());
+    }
+
+    [TestMethod]
+    public void ProtectResourceBearingDeletes_HasResourcesAndIsNotASource_IsProtected()
+    {
+        var toDelete = new HashSet<string>(["a"], StringComparer.OrdinalIgnoreCase);
+        var manifests = new Dictionary<string, IReadOnlyList<SkillResource>?>
+        {
+            ["a"] = [new SkillResource("r.json", SkillResourceType.Wisp, "d", CreatedAt: Old, DefinitionHash: "h")],
+        };
+        var toSave = new List<DreamService.SkillDreamEntryDto>
+        {
+            new("b", "s", "# b", SourceNames: null, SeeAlso: null),
+        };
+
+        var result = DreamService.ProtectResourceBearingDeletes(
+            toDelete, toSave, manifests, "test pass", Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+
+        Assert.AreEqual(0, result.Count);
+    }
+
     // ── Skill gap and sequence detection ─────────────────────────────────────
 
     [TestMethod]
@@ -256,6 +377,14 @@ public class DreamCodeOwnedSkillTests
         new(name, $"{name} guide", content ?? $"# {name} guide\n\n" + new string('x', 300), Old, Old, CodeOwned: true);
 
     private static Skill Plain(string name, string content) => new(name, "summary", content, Old, Old);
+
+    private static Skill PlainWithResource(string name, string content, string resourceFilename) =>
+        Plain(name, content) with
+        {
+            Manifest = [new SkillResource(
+                resourceFilename, SkillResourceType.Wisp, "a wisp", Provisional: true,
+                CreatedAt: Old, DefinitionHash: "shapehash-" + resourceFilename)],
+        };
 
     private static async Task<SkillBodyApplierTests.InMemorySkillStore> StoreWith(params Skill[] skills)
     {

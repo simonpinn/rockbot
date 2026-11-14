@@ -2364,18 +2364,22 @@ internal sealed class DreamService : IHostedService, IDisposable, IDreamCycleTri
         // Union of explicit toDelete names and all sourceNames referenced by saved skills,
         // less anything code-owned. Mirrors the exhaustive-deletion contract used for memory
         // consolidation.
-        var (toSave, allToDelete) = WithoutCodeOwnedSkills(result, protectedNames, "skill consolidation");
+        var (toSave, allToDeleteRaw) = WithoutCodeOwnedSkills(result, protectedNames, "skill consolidation");
 
         // Safety guard: refuse to delete skills when nothing is being saved in return.
         // The directive says "never delete without replacement" — enforce it in code so an
         // LLM that violates the rule cannot silently destroy the skill library.
-        if (allToDelete.Count > 0 && toSave.Count == 0)
+        if (allToDeleteRaw.Count > 0 && toSave.Count == 0)
         {
             _logger.LogWarning(
                 "DreamService: skill consolidation LLM proposed deleting {Count} skill(s) with no replacements — refusing to execute (possible LLM directive violation)",
-                allToDelete.Count);
+                allToDeleteRaw.Count);
             return;
         }
+
+        var allToDelete = ProtectResourceBearingDeletes(
+            allToDeleteRaw, toSave, all.ToDictionary(s => s.Name, s => s.Manifest, StringComparer.OrdinalIgnoreCase),
+            "skill consolidation", _logger);
 
         // Capture attached resources from sources BEFORE deletion. By default the
         // merge unions all attachments from the source skills onto the merged skill;
@@ -2567,6 +2571,54 @@ internal sealed class DreamService : IHostedService, IDisposable, IDreamCycleTri
             LogCodeOwnedRefusal(passName, name);
 
         return (toSave, toDelete);
+    }
+
+    /// <summary>
+    /// Refuses to delete a skill that still carries attached resources unless some
+    /// surviving <paramref name="toSave"/> entry names it in its <c>sourceNames</c> —
+    /// the only path <see cref="CaptureResourceInputsAsync"/> can ever recover those
+    /// resources through. <see cref="WithoutCodeOwnedSkills"/> unions explicit toDelete
+    /// names with every <c>sourceNames</c> entry across toSave, so a consolidation or
+    /// optimization response that deletes an old name (explicitly, or implicitly via
+    /// that union) without naming it as a source on its replacement would otherwise
+    /// destroy every wisp/script it carried while the new skill is saved with no
+    /// manifest at all — observed in practice: a rename whose directive instructs
+    /// "list the original skill name in sourceNames to trigger replacement" silently
+    /// dropped that field. Mirrors the "never delete without replacement" guard already
+    /// in <see cref="ConsolidateSkillsAsync"/>, one level more specific: here a
+    /// replacement exists, it just doesn't account for this particular source.
+    /// </summary>
+    internal static HashSet<string> ProtectResourceBearingDeletes(
+        HashSet<string> toDelete,
+        IReadOnlyList<SkillDreamEntryDto> toSave,
+        IReadOnlyDictionary<string, IReadOnlyList<SkillResource>?> manifestsByName,
+        string passName,
+        Microsoft.Extensions.Logging.ILogger logger)
+    {
+        if (toDelete.Count == 0)
+            return toDelete;
+
+        var accountedFor = new HashSet<string>(
+            toSave.SelectMany(d => d.SourceNames ?? []), StringComparer.OrdinalIgnoreCase);
+
+        var guarded = new HashSet<string>(toDelete, StringComparer.OrdinalIgnoreCase);
+        foreach (var name in toDelete)
+        {
+            if (accountedFor.Contains(name))
+                continue;
+
+            if (manifestsByName.TryGetValue(name, out var manifest) && manifest is { Count: > 0 })
+            {
+                guarded.Remove(name);
+                logger.LogWarning(
+                    "DreamService: {Pass} refused to delete '{Name}' — it carries {Count} attached " +
+                    "resource(s) and is not named as a source on any replacement; the LLM response " +
+                    "likely omitted sourceNames for it. Skill kept so its resources are not destroyed.",
+                    passName, name, manifest.Count);
+            }
+        }
+
+        return guarded;
     }
 
     /// <summary>
@@ -2775,7 +2827,17 @@ internal sealed class DreamService : IHostedService, IDisposable, IDreamCycleTri
         var deleted = 0;
         var saved = 0;
 
-        var (toSave, allToDelete) = WithoutCodeOwnedSkills(result, protectedNames, "skill optimization");
+        var (toSave, allToDeleteRaw) = WithoutCodeOwnedSkills(result, protectedNames, "skill optimization");
+
+        // Rewording a skill doesn't re-verify it against its MCP server; keep the baseline (#615).
+        var preDeleteSkills = await _skillStore!.ListAsync();
+        var baselineByName = preDeleteSkills
+            .ToDictionary(s => s.Name, s => s.SurfaceBaseline, StringComparer.OrdinalIgnoreCase);
+
+        var allToDelete = ProtectResourceBearingDeletes(
+            allToDeleteRaw, toSave,
+            preDeleteSkills.ToDictionary(s => s.Name, s => s.Manifest, StringComparer.OrdinalIgnoreCase),
+            "skill optimization", _logger);
 
         // Capture attachments BEFORE deletion so the improved skill carries them
         // forward. Optimize is the surgical-prose path — it rewrites content for
@@ -2791,10 +2853,6 @@ internal sealed class DreamService : IHostedService, IDisposable, IDreamCycleTri
             if (captured.Count > 0)
                 capturedResourcesByDto[dto.Name.Trim()] = captured;
         }
-
-        // Rewording a skill doesn't re-verify it against its MCP server; keep the baseline (#615).
-        var baselineByName = (await _skillStore!.ListAsync())
-            .ToDictionary(s => s.Name, s => s.SurfaceBaseline, StringComparer.OrdinalIgnoreCase);
 
         foreach (var name in allToDelete)
         {
@@ -5263,7 +5321,12 @@ internal sealed class DreamService : IHostedService, IDisposable, IDreamCycleTri
                 {
                     foreach (var record in group.Where(r => !string.IsNullOrEmpty(r.SessionId)).OrderByDescending(r => r.Timestamp))
                     {
-                        var events = await _skillUsageStore.GetBySessionAsync(record.SessionId!, ct);
+                        // A subagent/worker-originated wisp records its WM-namespace form
+                        // ("subagent/{id}") as SessionId, but skill usage (including anything
+                        // SkillUsageInheritance copied in) is keyed by the dash form
+                        // ("subagent-{id}") — convert or this lookup always misses.
+                        var events = await _skillUsageStore.GetBySessionAsync(
+                            SkillUsageInheritance.ToSkillUsageSessionId(record.SessionId!), ct);
                         var beforeWisp = events
                             .Where(e => e.Timestamp <= record.Timestamp && existingSkillNames.Contains(e.SkillName))
                             .OrderByDescending(e => e.Timestamp)
@@ -6897,7 +6960,15 @@ internal sealed class DreamService : IHostedService, IDisposable, IDreamCycleTri
                 continue;
 
             var src = await _skillStore.GetAsync(name);
-            if (src?.Manifest is not { Count: > 0 } manifest)
+            if (src is null)
+            {
+                _logger.LogWarning(
+                    "DreamService: capture source '{Name}' not found — sourceNames likely doesn't " +
+                    "match its stored name exactly; any resources it carries will not be preserved",
+                    name);
+                continue;
+            }
+            if (src.Manifest is not { Count: > 0 } manifest)
                 continue;
 
             foreach (var entry in manifest)
@@ -6920,7 +6991,8 @@ internal sealed class DreamService : IHostedService, IDisposable, IDreamCycleTri
                     entry.Filename, entry.Type, entry.Description, body,
                     Provisional: entry.Provisional,
                     VerifyHint: entry.VerifyHint,
-                    ToolFingerprints: entry.ToolFingerprints));
+                    ToolFingerprints: entry.ToolFingerprints,
+                    DefinitionHash: entry.DefinitionHash));
             }
         }
 
@@ -7199,7 +7271,7 @@ internal sealed class DreamService : IHostedService, IDisposable, IDreamCycleTri
         List<string>? ToDelete,
         List<SkillDreamEntryDto>? ToSave);
 
-    private sealed record SkillDreamEntryDto(
+    internal sealed record SkillDreamEntryDto(
         string Name,
         string? Summary,
         string Content,

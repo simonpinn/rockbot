@@ -24,6 +24,15 @@ namespace RockBot.Host;
 /// Carried onto the manifest entry's <see cref="SkillResource.ToolFingerprints"/> (#647). Set by
 /// the code that attaches a wisp, never by the model: it's hidden from the <c>save_skill</c> schema.
 /// </param>
+/// <param name="DefinitionHash">
+/// Carries an existing manifest entry's <see cref="SkillResource.DefinitionHash"/> forward when a
+/// skill-dream pass (consolidation/optimization) rewrites or renames a skill and re-saves its
+/// attached resources via the bulk <c>ISkillStore.SaveAsync(skill, resources)</c> path. For a wisp
+/// resource this is a shape hash, not a literal content hash — it must survive the rewrite so the
+/// resource stays matchable against real <c>WispExecutionRecord</c>s. Set only by that internal
+/// carry-forward code, never by the model: it's hidden from the <c>save_skill</c> schema. Null means
+/// "derive a fresh content hash" — correct for a resource with no prior identity to preserve.
+/// </param>
 public sealed record SkillResourceInput(
     string Filename,
     SkillResourceType Type,
@@ -31,4 +40,5 @@ public sealed record SkillResourceInput(
     string Content,
     bool Provisional = false,
     string? VerifyHint = null,
-    [property: System.Text.Json.Serialization.JsonIgnore] IReadOnlyDictionary<string, string>? ToolFingerprints = null);
+    [property: System.Text.Json.Serialization.JsonIgnore] IReadOnlyDictionary<string, string>? ToolFingerprints = null,
+    [property: System.Text.Json.Serialization.JsonIgnore] string? DefinitionHash = null);

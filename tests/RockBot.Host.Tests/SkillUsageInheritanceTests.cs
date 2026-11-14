@@ -78,4 +78,46 @@ public class SkillUsageInheritanceTests
 
         Assert.AreEqual(0, store.Appended.Count);
     }
+
+    [TestMethod]
+    public async Task InheritFromPrimarySessionAsync_PrimaryIdHasSessionNamespacePrefix_StripsItBeforeLookup()
+    {
+        // get_skill records events under the raw session id ("cli-session"), but
+        // spawn_subagent passes the working-memory namespace form ("session/cli-session")
+        // as primarySessionId — the lookup must strip the prefix to find them.
+        var store = new RecordingSkillUsageStore(
+            new SkillInvocationEvent("id-1", "trello-per-list-digests", "cli-session", DateTimeOffset.UtcNow.AddMinutes(-1)));
+
+        await SkillUsageInheritance.InheritFromPrimarySessionAsync(store, "session/cli-session", "subagent/abc123");
+
+        Assert.AreEqual(1, store.Appended.Count);
+        Assert.AreEqual("trello-per-list-digests", store.Appended[0].SkillName);
+        Assert.AreEqual("subagent/abc123", store.Appended[0].SessionId);
+    }
+
+    [TestMethod]
+    [DataRow("session/cli-session", "cli-session")]
+    [DataRow("subagent/abc123", "subagent-abc123")]
+    [DataRow("worker/abc123", "worker-abc123")]
+    [DataRow("SUBAGENT/abc123", "subagent-abc123")]
+    [DataRow("blazor-session", "blazor-session")]
+    [DataRow("patrol/daily-briefing-0800", "patrol/daily-briefing-0800")]
+    public void ToSkillUsageSessionId_ConvertsKnownNamespaceForms(string input, string expected) =>
+        Assert.AreEqual(expected, SkillUsageInheritance.ToSkillUsageSessionId(input));
+
+    [TestMethod]
+    public async Task InheritFromPrimarySessionAsync_PrimaryIdIsSubagentNamespaceForm_ConvertsBeforeLookup()
+    {
+        // A subagent that itself spawns further work (e.g. via spawn_wisps) reports its
+        // ToolInvokeRequest.SessionId in the WM-namespace form ("subagent/abc123"), but its
+        // own get_skill calls — and any inherited event — are recorded under the dash form
+        // ("subagent-abc123"). The lookup must convert, not just strip a prefix.
+        var store = new RecordingSkillUsageStore(
+            new SkillInvocationEvent("id-1", "trello-per-list-digests", "subagent-abc123", DateTimeOffset.UtcNow.AddMinutes(-1)));
+
+        await SkillUsageInheritance.InheritFromPrimarySessionAsync(store, "subagent/abc123", "subagent/def456");
+
+        Assert.AreEqual(1, store.Appended.Count);
+        Assert.AreEqual("trello-per-list-digests", store.Appended[0].SkillName);
+    }
 }

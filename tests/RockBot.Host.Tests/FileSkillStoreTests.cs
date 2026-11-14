@@ -858,6 +858,53 @@ public class FileSkillStoreTests
     }
 
     [TestMethod]
+    public async Task SaveAsync_WithResources_HonorsCarriedForwardDefinitionHash()
+    {
+        // A skill-dream rename/consolidation pass carries a wisp resource forward through
+        // CaptureResourceInputsAsync, which now sets SkillResourceInput.DefinitionHash from the
+        // original manifest entry (a shape hash, not a content hash). The bulk SaveAsync path
+        // must preserve it rather than recomputing a fresh content hash — otherwise the resource
+        // is silently orphaned from every future wisp execution that shares its real shape.
+        var store = CreateStore();
+        await store.SaveAsync(
+            MakeSkill("calendar/scan", "Scan", "# Scan"),
+            [new SkillResourceInput(
+                "fanout.json", SkillResourceType.Wisp, "Per-account fan-out", "{\"v\":1}",
+                DefinitionHash: "carried-shape-hash")]);
+
+        var saved = (await store.GetAsync("calendar/scan"))!.Manifest!.Single();
+        Assert.AreEqual("carried-shape-hash", saved.DefinitionHash);
+    }
+
+    [TestMethod]
+    public async Task SaveAsync_WithResources_NoDefinitionHash_ComputesContentHash()
+    {
+        var store = CreateStore();
+        await store.SaveAsync(
+            MakeSkill("calendar/scan", "Scan", "# Scan"),
+            [new SkillResourceInput("fanout.json", SkillResourceType.Wisp, "Per-account fan-out", "{\"v\":1}")]);
+
+        var saved = (await store.GetAsync("calendar/scan"))!.Manifest!.Single();
+        Assert.AreEqual(FileSkillStore.ComputeDefinitionHash("{\"v\":1}"), saved.DefinitionHash);
+    }
+
+    [TestMethod]
+    public async Task AttachResourceAsync_NoManifestEntry_HonorsInputDefinitionHash()
+    {
+        var store = CreateStore();
+        await store.SaveAsync(MakeSkill("calendar/scan", "Scan", "# Scan"));
+
+        await store.AttachResourceAsync(
+            "calendar/scan",
+            new SkillResourceInput(
+                "fanout.json", SkillResourceType.Wisp, "Per-account fan-out", "{}",
+                DefinitionHash: "carried-shape-hash"));
+
+        var saved = (await store.GetAsync("calendar/scan"))!.Manifest!.Single();
+        Assert.AreEqual("carried-shape-hash", saved.DefinitionHash);
+    }
+
+    [TestMethod]
     public async Task RemoveResourceAsync_RemovesManifestEntryAndFile()
     {
         var store = CreateStore();

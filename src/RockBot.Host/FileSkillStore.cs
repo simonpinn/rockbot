@@ -139,6 +139,10 @@ internal sealed partial class FileSkillStore : ISkillStore
             // metadata supplied on the input. CreatedAt is set to "now" for new entries
             // (the bulk path nukes the pre-existing manifest, so existing CreatedAt is
             // not preserved here — use AttachResourceAsync for additive single-resource saves).
+            // DefinitionHash: honor a carried-forward identity (e.g. a wisp's shape hash,
+            // surviving a dream-pass rename/consolidation via SkillResourceInput.DefinitionHash)
+            // rather than always recomputing a literal content hash — see that property's doc
+            // comment for why the two are not interchangeable for a wisp resource.
             var nowStamp = DateTimeOffset.UtcNow;
             var manifest = resources
                 .Select(r => new SkillResource(
@@ -148,7 +152,7 @@ internal sealed partial class FileSkillStore : ISkillStore
                     Provisional: r.Provisional,
                     CreatedAt: nowStamp,
                     VerifyHint: r.VerifyHint,
-                    DefinitionHash: ComputeDefinitionHash(r.Content),
+                    DefinitionHash: r.DefinitionHash ?? ComputeDefinitionHash(r.Content),
                     ToolFingerprints: r.ToolFingerprints))
                 .ToList();
 
@@ -269,7 +273,8 @@ internal sealed partial class FileSkillStore : ISkillStore
             var resourcePath = Path.Combine(folderPath, resource.Filename);
             await File.WriteAllTextAsync(resourcePath, resource.Content);
 
-            // Build the manifest entry — caller-supplied entry wins; otherwise derive from input.
+            // Build the manifest entry — caller-supplied entry wins; otherwise derive from input,
+            // honoring a carried-forward identity over recomputing a literal content hash.
             var entry = manifestEntry ?? new SkillResource(
                 resource.Filename,
                 resource.Type,
@@ -277,7 +282,7 @@ internal sealed partial class FileSkillStore : ISkillStore
                 Provisional: resource.Provisional,
                 CreatedAt: DateTimeOffset.UtcNow,
                 VerifyHint: resource.VerifyHint,
-                DefinitionHash: ComputeDefinitionHash(resource.Content),
+                DefinitionHash: resource.DefinitionHash ?? ComputeDefinitionHash(resource.Content),
                 ToolFingerprints: resource.ToolFingerprints);
 
             // Replace by filename (case-insensitive to match folder semantics) or append.

@@ -28,7 +28,7 @@ public static class SkillUsageInheritance
         if (usageStore is null || string.IsNullOrEmpty(primarySessionId))
             return;
 
-        var events = await usageStore.GetBySessionAsync(primarySessionId, ct);
+        var events = await usageStore.GetBySessionAsync(ToSkillUsageSessionId(primarySessionId), ct);
         var mostRecent = events.OrderByDescending(e => e.Timestamp).FirstOrDefault();
         if (mostRecent is null)
             return;
@@ -38,5 +38,37 @@ public static class SkillUsageInheritance
             SkillName: mostRecent.SkillName,
             SessionId: newSessionId,
             Timestamp: DateTimeOffset.UtcNow), ct);
+    }
+
+    /// <summary>
+    /// Converts a session identifier that may be in one of this codebase's
+    /// working-memory-namespace forms into the raw conversation-session-id form that
+    /// <see cref="ISkillUsageStore"/> actually keys events under — the same form
+    /// <c>get_skill</c> records under (<c>SkillTools._sessionId</c>).
+    ///
+    /// Two distinct identifiers exist per spawned session: a WM namespace (e.g.
+    /// <c>"subagent/{taskId}"</c>, <c>"session/{rawId}"</c>) used for working-memory
+    /// scoping and lineage tracking, and a conversation session id (e.g.
+    /// <c>"subagent-{taskId}"</c>, the raw id) used by <c>AgentLoopRunner</c>,
+    /// <c>SkillTools</c>, and the skill-usage store. Generic registry tools (including
+    /// <c>spawn_wisps</c>) report their <c>ToolInvokeRequest.SessionId</c> in the
+    /// WM-namespace form, so <c>WispExecutionRecord.SessionId</c> is in that form too —
+    /// without this conversion, every lookup against the skill-usage store misses.
+    /// </summary>
+    public static string ToSkillUsageSessionId(string sessionId)
+    {
+        const string SessionPrefix = "session/";
+        if (sessionId.StartsWith(SessionPrefix, StringComparison.OrdinalIgnoreCase))
+            return sessionId[SessionPrefix.Length..];
+
+        const string SubagentPrefix = "subagent/";
+        if (sessionId.StartsWith(SubagentPrefix, StringComparison.OrdinalIgnoreCase))
+            return "subagent-" + sessionId[SubagentPrefix.Length..];
+
+        const string WorkerPrefix = "worker/";
+        if (sessionId.StartsWith(WorkerPrefix, StringComparison.OrdinalIgnoreCase))
+            return "worker-" + sessionId[WorkerPrefix.Length..];
+
+        return sessionId;
     }
 }
