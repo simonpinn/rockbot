@@ -40,7 +40,16 @@ public sealed class ReflexToolCatalog(
                 if (resource.Type != SkillResourceType.Wisp || resource.Provisional)
                     continue;
 
-                var name = ReflexToolNames.Build(skill.Name, resource.Filename);
+                if (resource.DefinitionHash is not { } definitionHash)
+                {
+                    logger.LogWarning(
+                        "Reflex tool for '{Skill}/{File}' has no reflex tool: resource has no DefinitionHash. " +
+                        "It stays reachable through spawn_wisps.",
+                        skill.Name, resource.Filename);
+                    continue;
+                }
+
+                var name = ReflexToolNames.Build(definitionHash);
 
                 if (!McpWrapperNaming.FitsProviderLimit(name))
                 {
@@ -55,7 +64,7 @@ public sealed class ReflexToolCatalog(
                 {
                     logger.LogWarning(
                         "Reflex tool name '{Name}' is claimed by more than one skill resource this cycle " +
-                        "(sanitized collision) — keeping the first, skipping '{Skill}/{File}'",
+                        "(duplicate DefinitionHash) — keeping the first, skipping '{Skill}/{File}'",
                         name, skill.Name, resource.Filename);
                     continue;
                 }

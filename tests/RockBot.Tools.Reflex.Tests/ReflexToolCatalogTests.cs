@@ -18,7 +18,7 @@ public class ReflexToolCatalogTests
             [
                 new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest:
                 [
-                    new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false),
+                    new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: "hash1"),
                 ]),
             ],
         };
@@ -27,7 +27,7 @@ public class ReflexToolCatalogTests
 
         await catalog.ReconcileOnceAsync(CancellationToken.None);
 
-        var expectedName = ReflexToolNames.Build("calendar/scan", "fanout.json");
+        var expectedName = ReflexToolNames.Build("hash1");
         Assert.IsTrue(registry.GetTools().Any(t => t.Name == expectedName));
         Assert.IsTrue(((IReflexRegistrationLookup)catalog).TryGet(expectedName, out var skillName, out var filename));
         Assert.AreEqual("calendar/scan", skillName);
@@ -59,7 +59,7 @@ public class ReflexToolCatalogTests
     [TestMethod]
     public async Task ReconcileOnceAsync_ResourceDemotedSinceLastCycle_UnregistersTool()
     {
-        var resource = new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false);
+        var resource = new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: "hash1");
         var skillStore = new FakeSkillStore
         {
             Skills = [new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest: [resource])],
@@ -67,7 +67,7 @@ public class ReflexToolCatalogTests
         var registry = new FakeToolRegistry();
         var catalog = NewCatalog(skillStore, registry);
         await catalog.ReconcileOnceAsync(CancellationToken.None);
-        var name = ReflexToolNames.Build("calendar/scan", "fanout.json");
+        var name = ReflexToolNames.Build("hash1");
         Assert.IsTrue(registry.GetTools().Any(t => t.Name == name), "precondition: registered after cycle 1");
 
         // Phase 1's repair path demoted it back to provisional between cycles.
@@ -82,16 +82,16 @@ public class ReflexToolCatalogTests
     }
 
     [TestMethod]
-    public async Task ReconcileOnceAsync_TwoSkillsSanitizeToSameToolName_SkipsSecondWithoutThrowing()
+    public async Task ReconcileOnceAsync_TwoResourcesShareDefinitionHash_SkipsSecondWithoutThrowing()
     {
         var skillStore = new FakeSkillStore
         {
             Skills =
             [
-                new Skill("calendar_scan", "s", "c", DateTimeOffset.UtcNow, Manifest:
-                    [new SkillResource("x.json", SkillResourceType.Wisp, "d", Provisional: false)]),
-                new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest:
-                    [new SkillResource("x.json", SkillResourceType.Wisp, "d", Provisional: false)]),
+                new Skill("skill-a", "s", "c", DateTimeOffset.UtcNow, Manifest:
+                    [new SkillResource("x.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: "samehash")]),
+                new Skill("skill-b", "s", "c", DateTimeOffset.UtcNow, Manifest:
+                    [new SkillResource("y.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: "samehash")]),
             ],
         };
         var registry = new FakeToolRegistry();
@@ -99,19 +99,19 @@ public class ReflexToolCatalogTests
 
         await catalog.ReconcileOnceAsync(CancellationToken.None);
 
-        var name = ReflexToolNames.Build("calendar_scan", "x.json");
+        var name = ReflexToolNames.Build("samehash");
         Assert.AreEqual(1, registry.GetTools().Count(t => t.Name == name));
     }
 
     [TestMethod]
-    public async Task ReconcileOnceAsync_NameLongerThanProviderLimit_SkipsRegistration()
+    public async Task ReconcileOnceAsync_ResourceWithNoDefinitionHash_SkipsRegistrationWithoutThrowing()
     {
         var skillStore = new FakeSkillStore
         {
             Skills =
             [
-                new Skill(new string('a', 100), "s", "c", DateTimeOffset.UtcNow, Manifest:
-                    [new SkillResource("x.json", SkillResourceType.Wisp, "d", Provisional: false)]),
+                new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest:
+                    [new SkillResource("x.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: null)]),
             ],
         };
         var registry = new FakeToolRegistry();
@@ -130,11 +130,11 @@ public class ReflexToolCatalogTests
             Skills =
             [
                 new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest:
-                    [new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false)]),
+                    [new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: "hash1")]),
             ],
         };
         var registry = new FakeToolRegistry();
-        var name = ReflexToolNames.Build("calendar/scan", "fanout.json");
+        var name = ReflexToolNames.Build("hash1");
         // Some other component already owns this exact name - Register will throw.
         registry.Register(new ToolRegistration { Name = name, Description = "other", Source = "other" }, StubExecutor);
         var catalog = NewCatalog(skillStore, registry);
@@ -156,7 +156,7 @@ public class ReflexToolCatalogTests
     [TestMethod]
     public async Task ReconcileOnceAsync_ResourceDemotedSinceLastCycle_EvictsFromBoundSurface()
     {
-        var resource = new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false);
+        var resource = new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: "hash1");
         var skillStore = new FakeSkillStore
         {
             Skills = [new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest: [resource])],
@@ -168,7 +168,7 @@ public class ReflexToolCatalogTests
         catalog.Bind(surface);
 
         await catalog.ReconcileOnceAsync(CancellationToken.None);
-        var name = ReflexToolNames.Build("calendar/scan", "fanout.json");
+        var name = ReflexToolNames.Build("hash1");
         surface.ActivateByName("sess", name);
         Assert.IsTrue(surface.IsActivated("sess", name), "precondition");
 
@@ -182,6 +182,29 @@ public class ReflexToolCatalogTests
     }
 
     [TestMethod]
+    public async Task ReconcileOnceAsync_SkillRenamedBetweenCycles_ToolNameRemainsRegistered()
+    {
+        var resource = new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: "stablehash1");
+        var skillStore = new FakeSkillStore
+        {
+            Skills = [new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest: [resource])],
+        };
+        var registry = new FakeToolRegistry();
+        var catalog = NewCatalog(skillStore, registry);
+        await catalog.ReconcileOnceAsync(CancellationToken.None);
+        var name = ReflexToolNames.Build("stablehash1");
+        Assert.IsTrue(registry.GetTools().Any(t => t.Name == name), "precondition: registered after cycle 1");
+
+        // A dream rename changed the skill's display name; the resource (and its hash) are unchanged.
+        skillStore.Skills[0] = skillStore.Skills[0] with { Name = "calendar/scan-renamed" };
+        await catalog.ReconcileOnceAsync(CancellationToken.None);
+
+        Assert.IsTrue(registry.GetTools().Any(t => t.Name == name), "same hash must keep the same tool name across a rename");
+        Assert.IsTrue(((IReflexRegistrationLookup)catalog).TryGet(name, out var skillName, out _));
+        Assert.AreEqual("calendar/scan-renamed", skillName, "lookup must reflect the resource's current skill name");
+    }
+
+    [TestMethod]
     public async Task GetToolNames_ReturnsOnlyToolsRegisteredForThatSkill()
     {
         var skillStore = new FakeSkillStore
@@ -189,9 +212,9 @@ public class ReflexToolCatalogTests
             Skills =
             [
                 new Skill("calendar/scan", "s", "c", DateTimeOffset.UtcNow, Manifest:
-                    [new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false)]),
+                    [new SkillResource("fanout.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: "hashA")]),
                 new Skill("other/skill", "s", "c", DateTimeOffset.UtcNow, Manifest:
-                    [new SkillResource("x.json", SkillResourceType.Wisp, "d", Provisional: false)]),
+                    [new SkillResource("x.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: "hashB")]),
             ],
         };
         var registry = new FakeToolRegistry();
@@ -199,7 +222,7 @@ public class ReflexToolCatalogTests
         await catalog.ReconcileOnceAsync(CancellationToken.None);
 
         var lookup = (IReflexRegistrationLookup)catalog;
-        var expected = ReflexToolNames.Build("calendar/scan", "fanout.json");
+        var expected = ReflexToolNames.Build("hashA");
         CollectionAssert.AreEqual(new[] { expected }, lookup.GetToolNames("calendar/scan").ToArray());
         Assert.AreEqual(0, lookup.GetToolNames("no-such-skill").Count);
     }

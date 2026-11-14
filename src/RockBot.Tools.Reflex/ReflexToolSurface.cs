@@ -237,11 +237,11 @@ public sealed class ReflexToolSurface(
 
     void IReflexActivationHooks.OnSkillSurfaced(string? sessionId, string skillName) => Pin(sessionId, skillName);
 
-    string? IReflexActivationHooks.TryGetToolName(string skillName, string filename)
+    string? IReflexActivationHooks.TryGetToolName(string skillName, string filename, string? definitionHash)
     {
-        if (_lookup is not { } lookup)
+        if (_lookup is not { } lookup || definitionHash is null)
             return null;
-        var candidate = ReflexToolNames.Build(skillName, filename);
+        var candidate = ReflexToolNames.Build(definitionHash);
         return lookup.TryGet(candidate, out var actualSkill, out var actualFile)
             && actualSkill == skillName && actualFile == filename
             ? candidate

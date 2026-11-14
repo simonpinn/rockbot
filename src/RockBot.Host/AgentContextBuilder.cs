@@ -70,7 +70,7 @@ public sealed class AgentContextBuilder(
             return "";
         var names = (skill.Manifest ?? [])
             .Where(r => r.Type == SkillResourceType.Wisp && !r.Provisional)
-            .Select(r => reflexHooks.TryGetToolName(skill.Name, r.Filename))
+            .Select(r => reflexHooks.TryGetToolName(skill.Name, r.Filename, r.DefinitionHash))
             .Where(n => n is not null)
             .ToList();
         return names.Count > 0 ? $" (direct: {string.Join(", ", names)})" : "";

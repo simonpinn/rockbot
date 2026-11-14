@@ -230,17 +230,27 @@ public class ReflexToolSurfaceTests
     public void TryGetToolName_ValidatedResourceWithRegisteredReflex_ReturnsItsName()
     {
         var (surface, lookup, registry) = NewSurface();
-        var name = ReflexToolNames.Build("calendar/scan", "fanout.json");
+        var hash = "da8b3366e7837c2c";
+        var name = ReflexToolNames.Build(hash);
         RegisterTool(lookup, registry, "calendar/scan", "fanout.json", name);
 
-        Assert.AreEqual(name, ((IReflexActivationHooks)surface).TryGetToolName("calendar/scan", "fanout.json"));
+        Assert.AreEqual(name, ((IReflexActivationHooks)surface).TryGetToolName("calendar/scan", "fanout.json", hash));
     }
 
     [TestMethod]
     public void TryGetToolName_NotCurrentlyRegistered_ReturnsNull()
     {
         var (surface, _, _) = NewSurface();
-        Assert.IsNull(((IReflexActivationHooks)surface).TryGetToolName("calendar/scan", "fanout.json"));
+        Assert.IsNull(((IReflexActivationHooks)surface).TryGetToolName("calendar/scan", "fanout.json", "da8b3366e7837c2c"));
+    }
+
+    [TestMethod]
+    public void TryGetToolName_NullDefinitionHash_ReturnsNull()
+    {
+        var (surface, lookup, registry) = NewSurface();
+        RegisterTool(lookup, registry, "calendar/scan", "fanout.json", "reflex__anything");
+
+        Assert.IsNull(((IReflexActivationHooks)surface).TryGetToolName("calendar/scan", "fanout.json", null));
     }
 
     [TestMethod]

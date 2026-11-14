@@ -16,7 +16,9 @@ public interface IReflexActivationHooks
 
     /// <summary>
     /// The currently-registered reflex tool name for the resource at
-    /// <paramref name="skillName"/>/<paramref name="filename"/>, or null if none is registered.
+    /// <paramref name="skillName"/>/<paramref name="filename"/> with the given
+    /// <paramref name="definitionHash"/>, or null if none is registered or
+    /// <paramref name="definitionHash"/> is null.
     /// </summary>
-    string? TryGetToolName(string skillName, string filename);
+    string? TryGetToolName(string skillName, string filename, string? definitionHash);
 }
