@@ -36,6 +36,15 @@ public static partial class ToolSideEffects
     private const string TypedToolSeparator = "__";
 
     /// <summary>
+    /// A reflex tool's name prefix (<c>RockBot.Tools.Reflex.ReflexToolNames.Prefix</c> +
+    /// <c>Separator</c>, hardcoded here the same way <c>RockBot.Host</c> avoids a project reference
+    /// on <c>RockBot.Tools.Reflex</c> elsewhere). The rest of the name is an opaque content hash, not
+    /// a verb — classify it as side-effecting unconditionally rather than parse hash characters as
+    /// words, and never unwrap it as a generic <c>{server}__{tool}</c> wrapper.
+    /// </summary>
+    private const string ReflexToolPrefix = "reflex__";
+
+    /// <summary>
     /// The agent's own bookkeeping tools. They write, but only to the agent's scratch, memory or
     /// session state — never to an artifact the user is waiting on.
     /// </summary>
@@ -145,6 +154,7 @@ public static partial class ToolSideEffects
     {
         if (string.IsNullOrWhiteSpace(toolName)) return false;
         if (IsBookkeeping(toolName) || IsDelegation(toolName)) return false;
+        if (toolName.StartsWith(ReflexToolPrefix, StringComparison.Ordinal)) return true;
 
         var words = SplitWords(toolName);
         if (words.Count == 0) return false;
@@ -163,6 +173,9 @@ public static partial class ToolSideEffects
             var match = arguments is null ? null : InnerToolNameRegex().Match(arguments);
             return match is { Success: true } ? match.Groups["name"].Value : string.Empty;
         }
+
+        if (toolName.StartsWith(ReflexToolPrefix, StringComparison.Ordinal))
+            return toolName;
 
         var sep = toolName.IndexOf(TypedToolSeparator, StringComparison.Ordinal);
         return sep >= 0 ? toolName[(sep + TypedToolSeparator.Length)..] : toolName;

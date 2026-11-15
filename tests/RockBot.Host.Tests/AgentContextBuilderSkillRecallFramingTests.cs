@@ -326,7 +326,7 @@ public class AgentContextBuilderSkillRecallFramingTests
 
         public void OnSkillSurfaced(string? sessionId, string skillName) => SurfacedCalls.Add((sessionId, skillName));
 
-        public string? TryGetToolName(string skillName, string filename) =>
+        public string? TryGetToolName(string skillName, string filename, string? definitionHash) =>
             ToolNames.TryGetValue((skillName, filename), out var name) ? name : null;
     }
 

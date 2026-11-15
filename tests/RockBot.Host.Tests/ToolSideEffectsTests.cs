@@ -17,6 +17,7 @@ public class ToolSideEffectsTests
     [DataRow("execute_python_script", null)]
     [DataRow("sharepoint__sharepoint_upload_file", null)]       // typed MCP wrapper
     [DataRow("calendar-mcp__createEvent", null)]               // camelCase tool part
+    [DataRow("reflex__da8b3366e7837c2c", null)]                 // reflex tool: opaque hash name, assume side-effecting
     [DataRow("mcp_invoke_tool", "server_name=mail, tool_name=send_mail, arguments={}")]
     [DataRow("mcp_invoke_tool", "{\"server_name\":\"slides\",\"tool_name\":\"update_presentation\"}")]
     public void SideEffecting(string name, string? args)
@@ -58,5 +59,13 @@ public class ToolSideEffectsTests
         Assert.AreEqual("send_mail", ToolSideEffects.EffectiveToolName("mcp_invoke_tool", "server_name=m, tool_name=send_mail"));
         Assert.AreEqual("create_event", ToolSideEffects.EffectiveToolName("calendar__create_event", null));
         Assert.AreEqual("file_write", ToolSideEffects.EffectiveToolName("file_write", "path=x"));
+    }
+
+    [TestMethod]
+    public void EffectiveToolName_ReflexTool_KeepsFullNameUnwrapped()
+    {
+        // A reflex tool's name is an opaque content hash, not a "{server}__{tool}" wrapper — unwrapping
+        // it the generic way would classify the call by hash characters instead of its real effect.
+        Assert.AreEqual("reflex__da8b3366e7837c2c", ToolSideEffects.EffectiveToolName("reflex__da8b3366e7837c2c", null));
     }
 }

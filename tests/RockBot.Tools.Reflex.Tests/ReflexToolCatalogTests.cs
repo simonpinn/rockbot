@@ -205,6 +205,33 @@ public class ReflexToolCatalogTests
     }
 
     [TestMethod]
+    public async Task ReconcileOnceAsync_WinningResourceOfACollisionRenamedToSortAfterTheLoser_KeepsSameOwner()
+    {
+        var winnerResource = new SkillResource("x.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: "samehash");
+        var loserResource = new SkillResource("y.json", SkillResourceType.Wisp, "d", Provisional: false, DefinitionHash: "samehash");
+        var winnerSkill = new Skill("alpha", "s", "c", DateTimeOffset.UtcNow, Manifest: [winnerResource]);
+        var loserSkill = new Skill("beta", "s", "c", DateTimeOffset.UtcNow, Manifest: [loserResource]);
+        var skillStore = new FakeSkillStore { Skills = [winnerSkill, loserSkill] };
+        var registry = new FakeToolRegistry();
+        var catalog = NewCatalog(skillStore, registry);
+        await catalog.ReconcileOnceAsync(CancellationToken.None);
+
+        var name = ReflexToolNames.Build("samehash");
+        Assert.IsTrue(((IReflexRegistrationLookup)catalog).TryGet(name, out _, out var filename));
+        Assert.AreEqual("x.json", filename, "precondition: alpha/x.json won the collision");
+
+        // A dream rename changed "alpha" to a name that now sorts after "beta" — simulated here by
+        // both renaming it and reordering the list the way FileSkillStore's name-sorted ListAsync would.
+        winnerSkill = winnerSkill with { Name = "zeta-merged" };
+        skillStore.Skills = [loserSkill, winnerSkill];
+        await catalog.ReconcileOnceAsync(CancellationToken.None);
+
+        Assert.IsTrue(((IReflexRegistrationLookup)catalog).TryGet(name, out var skillNameAfter, out var filenameAfter));
+        Assert.AreEqual("x.json", filenameAfter, "the same resource must stay the owner even though a different candidate now sorts first");
+        Assert.AreEqual("zeta-merged", skillNameAfter, "lookup must reflect the resource's current skill name");
+    }
+
+    [TestMethod]
     public async Task GetToolNames_ReturnsOnlyToolsRegisteredForThatSkill()
     {
         var skillStore = new FakeSkillStore

@@ -24,15 +24,6 @@ public static class ReflexToolNames
     public static string Build(string definitionHash) =>
         $"{Prefix}{Separator}{Sanitize(definitionHash)}";
 
-    /// <summary>
-    /// TEMPORARY two-argument overload, retained only until <c>ReflexToolCatalog</c> and
-    /// <c>ReflexToolSurface</c> switch to <see cref="Build(string)"/> (Tasks 2 and 3 of
-    /// <c>docs/superpowers/plans/2026-11-14-reflex-tool-naming.md</c>). Deleted at the end of
-    /// Task 3, once nothing in this project still calls it.
-    /// </summary>
-    public static string Build(string skillName, string filename) =>
-        $"{Prefix}{Separator}{Sanitize(skillName)}{Separator}{Sanitize(filename)}";
-
     private static string Sanitize(string value) =>
         value.All(IsAllowed) ? value : new string(value.Select(c => IsAllowed(c) ? c : '-').ToArray());
 

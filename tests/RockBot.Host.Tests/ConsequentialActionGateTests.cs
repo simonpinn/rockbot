@@ -36,6 +36,7 @@ public class ConsequentialActionGateTests
     [DataRow("mcp_invoke_tool", """{"server_name":"mail","tool_name":"forward_message"}""", true)]
     [DataRow("schedule_task", null, true)]
     [DataRow("cancel_scheduled_task", null, true)]
+    [DataRow("reflex__da8b3366e7837c2c", null, true)]            // reflex tool: opaque name, assume consequential
     [DataRow("calendar-mcp__list_events", null, false)]
     [DataRow("mcp_invoke_tool", "server_name=calendar-mcp, tool_name=get_event", false)]
     [DataRow("file_write", "path=drafts/talk.md", false)]

@@ -31,7 +31,8 @@ public sealed class ReflexToolCatalog(
 
     public async Task ReconcileOnceAsync(CancellationToken ct)
     {
-        var desired = new Dictionary<string, (string SkillName, string Filename, string Description)>();
+        var current = _byName;
+        var candidatesByName = new Dictionary<string, List<(string SkillName, string Filename, string Description)>>();
         var skills = await skillStore.ListAsync();
         foreach (var skill in skills)
         {
@@ -60,23 +61,57 @@ public sealed class ReflexToolCatalog(
                     continue;
                 }
 
-                if (desired.ContainsKey(name))
+                if (!candidatesByName.TryGetValue(name, out var candidates))
+                    candidatesByName[name] = candidates = [];
+                candidates.Add((skill.Name, resource.Filename, resource.Description));
+            }
+        }
+
+        // Resolve each name's candidate(s) to a single winner. A hash is a *shape* hash, so more
+        // than one validated resource legitimately sharing one is an expected outcome, not a rare
+        // accident — and because ListAsync's order can shift (a dream rename re-sorts skills by
+        // name), picking "whichever candidate sorts first this cycle" would let an unrelated
+        // rename silently re-point an already-registered tool at a different resource. Sticky
+        // tie-break: prefer whichever candidate still matches the name's current owner by
+        // filename (stable across a rename, unlike skill name) before falling back to order.
+        var desired = new Dictionary<string, (string SkillName, string Filename, string Description)>();
+        foreach (var (name, candidates) in candidatesByName)
+        {
+            var winner = candidates[0];
+            if (candidates.Count > 1 && current.TryGetValue(name, out var owner))
+            {
+                var sticky = candidates.FirstOrDefault(c => c.Filename == owner.Filename);
+                if (!Equals(sticky, default((string, string, string))))
+                    winner = sticky;
+            }
+
+            if (candidates.Count > 1)
+            {
+                foreach (var candidate in candidates)
                 {
+                    if (Equals(candidate, winner))
+                        continue;
                     logger.LogWarning(
                         "Reflex tool name '{Name}' is claimed by more than one skill resource this cycle " +
-                        "(duplicate DefinitionHash) — keeping the first, skipping '{Skill}/{File}'",
-                        name, skill.Name, resource.Filename);
-                    continue;
+                        "(duplicate DefinitionHash) — keeping '{WinnerSkill}/{WinnerFile}', skipping '{Skill}/{File}'",
+                        name, winner.SkillName, winner.Filename, candidate.SkillName, candidate.Filename);
                 }
-
-                desired[name] = (skill.Name, resource.Filename, resource.Description);
             }
+
+            if (current.TryGetValue(name, out var previousOwner) && previousOwner.Filename != winner.Filename)
+            {
+                logger.LogWarning(
+                    "Reflex tool '{Name}' changed owner from '{OldSkill}/{OldFile}' to '{NewSkill}/{NewFile}' " +
+                    "— the previous resource is no longer eligible (demoted, deleted, or lost the hash)",
+                    name, previousOwner.SkillName, previousOwner.Filename, winner.SkillName, winner.Filename);
+            }
+
+            desired[name] = winner;
         }
 
         List<string> stale = [];
         lock (_gate)
         {
-            var current = _byName;
             var executor = sharedExecutor();
 
             foreach (var name in current.Keys)
